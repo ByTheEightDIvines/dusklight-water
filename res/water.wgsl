@@ -324,7 +324,19 @@ fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> @locati
 
     // Absorption: red goes first, then green, blue lasts longest.
     let lum = clamp(luminance(u.amb.rgb) * 1.4, 0.12, 1.0);
-    let deep_col = (vec3f(0.050, 0.100, 0.085) + u.horizon.rgb * 0.10) * (0.35 + lum);
+    // Water body colour: shallow tint fading into the deep tint with thickness. Palette 0 is the
+    // turquoise-to-blue of Super Mario Sunshine's sea.
+    var shallow_col = vec3f(0.08, 0.62, 0.66);
+    var deep_tint = vec3f(0.02, 0.22, 0.50);
+    if u.sun2.z > 1.5 {
+        shallow_col = vec3f(0.05, 0.35, 0.60);
+        deep_tint = vec3f(0.01, 0.08, 0.30);
+    } else if u.sun2.z > 0.5 {
+        shallow_col = vec3f(0.10, 0.40, 0.35);
+        deep_tint = vec3f(0.03, 0.14, 0.16);
+    }
+    let deep_col = (mix(shallow_col, deep_tint, smoothstep(40.0, 700.0, thick)) +
+                    u.horizon.rgb * 0.06) * (0.45 + 0.85 * lum);
     let absorb = vec3f(0.0120, 0.0046, 0.0030) / max(u.screen.w, 0.1);
     let trans = exp(-absorb * thick);
     let body = under * trans + deep_col * (vec3f(1.0) - trans);
@@ -347,9 +359,9 @@ fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> @locati
     // Foam: shoreline (thin water) and wave crests.
     let fn1 = fbm(world.xz * 0.045 + vec2f(t * 0.05, t * 0.03));
     let fn2 = fbm(world.xz * 0.11 - vec2f(t * 0.04, -t * 0.06));
-    let shore = (1.0 - smoothstep(4.0, 55.0, thick)) * smoothstep(0.0, 6.0, thick + 3.0);
+    let shore = (1.0 - smoothstep(3.0, 34.0, thick)) * smoothstep(0.0, 8.0, thick + 3.0);
     let band = 0.5 + 0.5 * sin(thick * 0.14 - t * 1.3 + fn1 * 6.0);
-    var foam = shore * smoothstep(0.30, 0.70, fn1 * 0.6 + band * 0.55);
+    var foam = shore * smoothstep(0.40, 0.85, fn1 * 0.6 + band * 0.55) * 0.6;
     let crest = smoothstep(0.62, 0.95, (w.x - sun_swell(world.xz).x) / (BASE_AMPLITUDE * 0.9)) * clamp(a_scale, 0.0, 1.0);
     foam = foam + crest * smoothstep(0.45, 0.75, fn2) * 0.8;
     foam = clamp(foam, 0.0, 1.0);
@@ -445,8 +457,11 @@ fn vs_sun(@builtin(vertex_index) vi: u32) -> SunOut {
 
 @fragment
 fn fs_sun(in: SunOut) -> @location(0) vec4f {
-    let t0 = textureSample(wave_tex, wave_samp, in.uv0).r;
-    let t1 = textureSample(wave_tex, wave_samp, in.uv1).r;
+    // Low-frequency warp of the texture coordinates breaks up the obvious tiling lattice.
+    let wp0 = in.uv0 + (vec2f(vnoise(in.uv0 * 3.1), vnoise(in.uv0 * 3.1 + 7.3)) - 0.5) * 0.45;
+    let wp1 = in.uv1 + (vec2f(vnoise(in.uv1 * 2.7 + 3.9), vnoise(in.uv1 * 2.7 + 11.1)) - 0.5) * 0.45;
+    let t0 = textureSample(wave_tex, wave_samp, wp0).r;
+    let t1 = textureSample(wave_tex, wave_samp, wp1).r;
 
     // Depth test against the scene (LEQUAL): the overlay must not show through terrain.
     let d = textureLoad(scene_depth, vec2i(in.pos.xy), 0).r;
@@ -466,14 +481,18 @@ fn fs_sun(in: SunOut) -> @location(0) vec4f {
 
     let a0 = clamp(t0 * in.va, 0.0, 1.0);
     let a = clamp(2.0 * t1 * a0, 0.0, 1.0);
-    let a8 = floor(a * 255.0 + 0.5);
-    // GXSetAlphaCompare(GEQUAL 0x55, OR, LEQUAL 0x23)
-    if a8 < 85.0 && a8 > 35.0 {
-        discard;
+    let a8 = a * 255.0;
+    // GXSetAlphaCompare(GEQUAL 0x55, OR, LEQUAL 0x23), with the cut-off softened so the specks
+    // have smooth edges instead of hard blocks.
+    var vis = 1.0 - smoothstep(22.0, 40.0, a8);
+    if a8 >= 85.0 {
+        vis = 1.0;
     }
+    // Far specks only alias into rows; fade them out with distance.
+    vis = vis * (1.0 - smoothstep(1500.0, 5000.0, in.pos.w));
     // RASC * 2 clamps to white; the tint lets the colour be adjusted later.
     let colour = clamp(vec3f(200.0, 200.0, 255.0) / 255.0 * 2.0, vec3f(0.0), vec3f(1.0)) * vec3f(1.0);
-    return vec4f(colour, a * u.sun2.w);
+    return vec4f(colour, a * vis * u.sun2.w);
 }
 
 

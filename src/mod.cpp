@@ -74,6 +74,7 @@ ConfigVarHandle g_cvarDebug = 0;
 ConfigVarHandle g_cvarMode = 0;
 ConfigVarHandle g_cvarOverlay = 0;
 ConfigVarHandle g_cvarRefract = 0;
+ConfigVarHandle g_cvarColor = 0;
 
 GfxDrawTypeHandle g_drawType = 0;
 GfxStageHookHandle g_stageHook = 0;
@@ -753,7 +754,8 @@ void fill_uniforms(Uniforms& uni, const CameraInfo& camera, uint32_t width, uint
     const float refract =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRefract, 100), 0, 400)) /
         100.0f;
-    set4(uni.sun2, refract, get_int_option(g_cvarMode, 1) == 1 ? 1.0f : 0.0f, 1.0f, overlay);
+    set4(uni.sun2, refract, get_int_option(g_cvarMode, 1) == 1 ? 1.0f : 0.0f,
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarColor, 0), 0, 2)), overlay);
 }
 
 // Game thread, after opaque scene draws and before translucent overlays (including stock water).
@@ -963,6 +965,17 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     control.option_count = 2;
     svc_ui->pane_add_control(mod_ctx, panel, &control, nullptr);
 
+    static const char* kColorOptions[] = {"Sunshine turquoise", "Twilight green", "Deep blue"};
+    control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_SELECT;
+    control.label = "Water Colour";
+    control.help_rml = "Body colour of the water in Rolling waves style.";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarColor;
+    control.options = kColorOptions;
+    control.option_count = 3;
+    svc_ui->pane_add_control(mod_ctx, panel, &control, nullptr);
+
     add_number(panel, "Foam Intensity", "Brightness of the Sunshine wave foam.", g_cvarOverlay, 0,
         400, 10, "%");
     add_number(panel, "Refraction", "Sunshine-style wobble of the view through the water.",
@@ -1012,7 +1025,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         register_int_option("debugView", 0, g_cvarDebug, error) != MOD_OK ||
         register_int_option("style", 1, g_cvarMode, error) != MOD_OK ||
         register_int_option("foamIntensity", 100, g_cvarOverlay, error) != MOD_OK ||
-        register_int_option("refraction", 100, g_cvarRefract, error) != MOD_OK)
+        register_int_option("refraction", 100, g_cvarRefract, error) != MOD_OK ||
+        register_int_option("waterColor", 0, g_cvarColor, error) != MOD_OK)
     {
         return MOD_ERROR;
     }
@@ -1104,7 +1118,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         g_sampler = nullptr;
     }
     g_cvarEnabled = g_cvarWaveHeight = g_cvarNormals = g_cvarClarity = g_cvarFog = g_cvarDebug = 0;
-    g_cvarMode = g_cvarOverlay = g_cvarRefract = 0;
+    g_cvarMode = g_cvarOverlay = g_cvarRefract = g_cvarColor = 0;
     g_drawType = g_sunDrawType = 0;
     g_stageHook = g_hudHook = 0;
     return MOD_OK;
