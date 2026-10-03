@@ -19,7 +19,10 @@ struct U {
     lat: vec4f,      // x ix0, y iz0, z width, w cell size
     screen: vec4f,   // x width, y height, z debug mode, w clarity
     lat2: vec4f,     // coarse lattice: x ix0, y iz0, z width, w cell size
-    warp: vec4f,     // x linear step, y quadratic term of the grid radial warp, z fine radius
+    warp: vec4f,     // x linear step, y quadratic term of the grid radial warp, z fine radius, w reversed-Z
+    sun0: vec4f,     // Sunshine overlay: x,y centre (player) xz, z,w wave phases
+    sun1: vec4f,     // Sunshine overlay: x,y wave amplitudes, z,w texture scroll
+    sun2: vec4f,     // Sunshine overlay: xyz colour tint, w intensity
 }
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -27,6 +30,8 @@ struct U {
 @group(0) @binding(2) var scene_color: texture_2d<f32>;
 @group(0) @binding(3) var scene_depth: texture_2d<f32>;
 @group(0) @binding(4) var samp: sampler;
+@group(0) @binding(5) var wave_tex: texture_2d<f32>;
+@group(0) @binding(6) var wave_samp: sampler;
 
 const WAVE_COUNT_VERTEX: i32 = 4;
 const WAVE_COUNT_FRAG: i32 = 8;
@@ -350,4 +355,103 @@ fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> @locati
         }
     }
     return vec4f(max(col, vec3f(0.0)), 1.0);
+}
+
+
+// ===============================================================================================
+// Sunshine wave overlay (TMapObjWave, ported from the Super Mario Sunshine decompilation).
+//
+// A 5200 x 5200 unit grid of 200 unit cells follows the player. Height is two crossing sines,
+//   y = A1 * sin(0.02 * x / 2pi + phase1) + A2 * sin(0.03 * z / 2pi + phase2),
+// each phase advancing every game frame. The mesh is drawn with two copies of wave.bti (an I4
+// intensity texture used as alpha) scrolling in different directions:
+//   stage 0: alpha = tex0.a * vertex.a
+//   stage 1: alpha = 2 * tex1.a * previous alpha          (colour = vertex colour * 2, i.e. white)
+// Pixels pass the alpha test only if alpha >= 0x55 or alpha <= 0x23, and are blended as
+// src * srcAlpha + dst * srcColour, which with a white source is additive.
+// Vertex alpha fades linearly with Chebyshev distance from the player.
+// ===============================================================================================
+const SUN_CELL: f32 = 200.0;
+const SUN_HALF: f32 = 2600.0;
+const SUN_COLS: u32 = 25u;
+
+struct SunOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv0: vec2f,
+    @location(1) uv1: vec2f,
+    @location(2) va: f32,
+}
+
+@vertex
+fn vs_sun(@builtin(vertex_index) vi: u32) -> SunOut {
+    var o: SunOut;
+    let quad = vi / 6u;
+    let corner = vi % 6u;
+    var cx = array<u32, 6>(0u, 1u, 0u, 1u, 1u, 0u);
+    var cz = array<u32, 6>(0u, 0u, 1u, 0u, 1u, 1u);
+    let gx = quad % SUN_COLS + cx[corner];
+    let gz = quad / SUN_COLS + cz[corner];
+    let xo = -SUN_HALF + f32(gx) * SUN_CELL;
+    let zo = -SUN_HALF + f32(gz) * SUN_CELL;
+    let x = u.sun0.x + xo;
+    let z = u.sun0.y + zo;
+
+    let info = surface_info(vec2f(x, z));
+    if info.w < 1e-4 || info.z < 0.01 {
+        o.pos = vec4f(2.0, 2.0, 2.0, 1.0); // not open water: culled
+        o.uv0 = vec2f(0.0);
+        o.uv1 = vec2f(0.0);
+        o.va = 0.0;
+        return o;
+    }
+    // TMapObjWave::updateHeightAndAlpha: swell and alpha shrink toward the shore.
+    let depth = info.y;
+    let amp = clamp(depth / 400.0, 0.0, 1.0);
+    let a1 = u.sun1.x * amp;
+    let a2 = u.sun1.y * amp;
+    let h = a1 * sin(0.02 * (x * (1.0 / 6.28318)) + u.sun0.z)
+          + a2 * sin(0.03 * (z * (1.0 / 6.28318)) + u.sun0.w);
+    let world = vec3f(x, info.x + h * u.params.y, z);
+    o.pos = u.proj_from_world * vec4f(world, 1.0);
+
+    // TMapObjWave::getAlpha, then the shore ramp (unk54).
+    let fade = floor(255.0 * (1.0 - (1.0 / SUN_HALF) * max(abs(xo), abs(zo)))) / 255.0;
+    o.va = clamp(fade, 0.0, 1.0) * clamp(depth / 150.0, 0.0, 1.0);
+
+    o.uv0 = vec2f(x * 0.0012 + u.sun1.z, z * 0.0012);
+    o.uv1 = vec2f(x * 0.0012, u.sun1.w + z * 0.0015);
+    return o;
+}
+
+@fragment
+fn fs_sun(in: SunOut) -> @location(0) vec4f {
+    let t0 = textureSample(wave_tex, wave_samp, in.uv0).r;
+    let t1 = textureSample(wave_tex, wave_samp, in.uv1).r;
+
+    // Depth test against the scene (LEQUAL): the overlay must not show through terrain.
+    let d = textureLoad(scene_depth, vec2i(in.pos.xy), 0).r;
+    if u.warp.w > 0.5 {
+        if in.pos.z < d - 1e-6 {
+            discard;
+        }
+    } else {
+        if in.pos.z > d + 1e-6 {
+            discard;
+        }
+    }
+
+    if u.screen.z > 0.5 {
+        return vec4f(0.1, 0.9, 0.3, 0.5); // debug: where the overlay exists
+    }
+
+    let a0 = clamp(t0 * in.va, 0.0, 1.0);
+    let a = clamp(2.0 * t1 * a0, 0.0, 1.0);
+    let a8 = floor(a * 255.0 + 0.5);
+    // GXSetAlphaCompare(GEQUAL 0x55, OR, LEQUAL 0x23)
+    if a8 < 85.0 && a8 > 35.0 {
+        discard;
+    }
+    // RASC * 2 clamps to white; the tint lets the colour be adjusted later.
+    let colour = clamp(vec3f(200.0, 200.0, 255.0) / 255.0 * 2.0, vec3f(0.0), vec3f(1.0)) * u.sun2.xyz;
+    return vec4f(colour, a * u.sun2.w);
 }

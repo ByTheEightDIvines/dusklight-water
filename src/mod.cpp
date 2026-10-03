@@ -71,15 +71,32 @@ ConfigVarHandle g_cvarNormals = 0;
 ConfigVarHandle g_cvarClarity = 0;
 ConfigVarHandle g_cvarFog = 0;
 ConfigVarHandle g_cvarDebug = 0;
+ConfigVarHandle g_cvarMode = 0;
+ConfigVarHandle g_cvarOverlay = 0;
 
 GfxDrawTypeHandle g_drawType = 0;
 GfxStageHookHandle g_stageHook = 0;
+GfxStageHookHandle g_hudHook = 0;
+GfxDrawTypeHandle g_sunDrawType = 0;
 ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
 GfxRenderTargetLayout g_layout = GFX_RENDER_TARGET_LAYOUT_INIT;
 WGPURenderPipeline g_pipeline = nullptr;
 WGPUBindGroupLayout g_bindLayout = nullptr;
 WGPUSampler g_sampler = nullptr;
+WGPUSampler g_repeatSampler = nullptr;
+WGPUTexture g_waveTex = nullptr;
+WGPUTextureView g_waveView = nullptr;
+ResourceBuffer g_waveRaw = RESOURCE_BUFFER_INIT;
+WGPURenderPipeline g_sunPipeline = nullptr;
+WGPUBindGroupLayout g_sunLayout = nullptr;
+GfxRenderTargetLayout g_sunPipelineLayout = GFX_RENDER_TARGET_LAYOUT_INIT;
+
+// Per-frame state handed from the after-opaque hook to the before-HUD hook (game thread).
+CameraInfo g_frameCamera = CAMERA_INFO_INIT;
+float g_framePlayer[3] = {0.0f, 0.0f, 0.0f};
+bool g_frameValid = false;
+bool g_frameAnyOpen = false;
 bool g_warnedNoResolve = false;
 bool g_loggedFirstDraw = false;
 
@@ -280,6 +297,9 @@ struct Uniforms {
     float screen[4];
     float lat2[4];
     float warp[4];
+    float sun0[4];
+    float sun1[4];
+    float sun2[4];
 };
 static_assert(sizeof(Uniforms) % 16 == 0);
 
@@ -430,6 +450,209 @@ void on_draw(
     wgpuBindGroupRelease(group);
 }
 
+struct SunPayload {
+    WGPUTextureView depth;
+    uint32_t uniform_offset;
+    uint32_t uniform_size;
+    uint32_t storage_offset;
+    uint32_t storage_size;
+    uint32_t vertex_count;
+    uint32_t _pad;
+};
+static_assert(sizeof(SunPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
+static_assert(std::is_trivially_copyable_v<SunPayload>);
+
+constexpr uint32_t kSunCols = 25;
+constexpr uint32_t kSunRows = 26;
+
+void release_sun_pipeline() {
+    if (g_sunPipeline != nullptr) {
+        wgpuRenderPipelineRelease(g_sunPipeline);
+        g_sunPipeline = nullptr;
+    }
+    if (g_sunLayout != nullptr) {
+        wgpuBindGroupLayoutRelease(g_sunLayout);
+        g_sunLayout = nullptr;
+    }
+    g_sunPipelineLayout = GFX_RENDER_TARGET_LAYOUT_INIT;
+}
+
+bool build_sun_pipeline(const GfxRenderTargetLayout& layout) {
+    WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
+    wgsl.code = {static_cast<const char*>(g_shaderSource.data), g_shaderSource.size};
+    WGPUShaderModuleDescriptor moduleDesc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    moduleDesc.nextInChain = &wgsl.chain;
+    moduleDesc.label = {"Better Water (Sunshine)", WGPU_STRLEN};
+    WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_deviceInfo.device, &moduleDesc);
+    if (module == nullptr) {
+        return false;
+    }
+
+    // GXSetBlendMode(BLEND, SRCALPHA, SRCCLR): with a white source colour this is additive.
+    WGPUBlendState blend{
+        .color = {.operation = WGPUBlendOperation_Add,
+            .srcFactor = WGPUBlendFactor_SrcAlpha,
+            .dstFactor = WGPUBlendFactor_One},
+        .alpha = {.operation = WGPUBlendOperation_Add,
+            .srcFactor = WGPUBlendFactor_Zero,
+            .dstFactor = WGPUBlendFactor_One},
+    };
+    WGPUColorTargetState colorTargets[GFX_MAX_COLOR_ATTACHMENTS];
+    const uint32_t colorTargetCount =
+        gfx_init_color_target_states(&layout, colorTargets, &blend, WGPUColorWriteMask_All);
+
+    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+    fragment.module = module;
+    fragment.entryPoint = {"fs_sun", WGPU_STRLEN};
+    fragment.targetCount = colorTargetCount;
+    fragment.targets = colorTargets;
+
+    // Depth is tested manually in the shader against the scene snapshot; no depth write
+    // (GXSetZMode(TRUE, LEQUAL, FALSE)).
+    WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
+    depthStencil.format = layout.depth_stencil_format;
+    depthStencil.depthWriteEnabled = WGPUOptionalBool_False;
+    depthStencil.depthCompare = WGPUCompareFunction_Always;
+
+    WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    desc.label = {"Better Water (Sunshine)", WGPU_STRLEN};
+    desc.vertex.module = module;
+    desc.vertex.entryPoint = {"vs_sun", WGPU_STRLEN};
+    desc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    desc.primitive.cullMode = WGPUCullMode_None;
+    desc.depthStencil = &depthStencil;
+    desc.multisample.count = layout.sample_count;
+    desc.fragment = &fragment;
+    g_sunPipeline = wgpuDeviceCreateRenderPipeline(g_deviceInfo.device, &desc);
+    wgpuShaderModuleRelease(module);
+    if (g_sunPipeline == nullptr) {
+        return false;
+    }
+    g_sunLayout = wgpuRenderPipelineGetBindGroupLayout(g_sunPipeline, 0);
+    if (g_sunLayout == nullptr) {
+        release_sun_pipeline();
+        return false;
+    }
+    g_sunPipelineLayout = layout;
+    return true;
+}
+
+bool ensure_sun_pipeline(const GfxRenderTargetLayout& layout) {
+    if (g_sunPipeline != nullptr && g_sunPipelineLayout.key == layout.key) {
+        return true;
+    }
+    release_sun_pipeline();
+    if (!build_sun_pipeline(layout)) {
+        release_sun_pipeline();
+        svc_log->error(mod_ctx, "failed to build Sunshine wave pipeline (shader error?)");
+        return false;
+    }
+    return true;
+}
+
+// Render worker thread.
+void on_sun_draw(
+    ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
+    if (payloadSize != sizeof(SunPayload) || !ensure_sun_pipeline(ctx->layout)) {
+        return;
+    }
+    SunPayload data;
+    std::memcpy(&data, payload, sizeof(data));
+    if (data.depth == nullptr || g_waveView == nullptr || g_repeatSampler == nullptr) {
+        return;
+    }
+
+    WGPUBindGroupEntry entries[5] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    entries[0].binding = 0;
+    entries[0].buffer = ctx->uniform_buffer;
+    entries[0].offset = data.uniform_offset;
+    entries[0].size = data.uniform_size;
+    entries[1].binding = 1;
+    entries[1].buffer = ctx->storage_buffer;
+    entries[1].offset = data.storage_offset;
+    entries[1].size = data.storage_size;
+    entries[2].binding = 3;
+    entries[2].textureView = data.depth;
+    entries[3].binding = 5;
+    entries[3].textureView = g_waveView;
+    entries[4].binding = 6;
+    entries[4].sampler = g_repeatSampler;
+    WGPUBindGroupDescriptor bindDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    bindDesc.layout = g_sunLayout;
+    bindDesc.entryCount = 5;
+    bindDesc.entries = entries;
+    WGPUBindGroup group = wgpuDeviceCreateBindGroup(ctx->device, &bindDesc);
+    if (group == nullptr) {
+        return;
+    }
+    wgpuRenderPassEncoderSetPipeline(ctx->pass, g_sunPipeline);
+    wgpuRenderPassEncoderSetBindGroup(ctx->pass, 0, group, 0, nullptr);
+    wgpuRenderPassEncoderDraw(ctx->pass, data.vertex_count, 1, 0, 0);
+    wgpuBindGroupRelease(group);
+}
+
+// wave.bti from Super Mario Sunshine: 128x256 I4 intensity, decoded to R8 with a box-filtered
+// mip chain.
+bool create_wave_texture() {
+    constexpr uint32_t kW = 128;
+    constexpr uint32_t kH = 256;
+    if (g_waveRaw.data == nullptr || g_waveRaw.size < kW * kH) {
+        return false;
+    }
+    uint32_t levels = 1;
+    for (uint32_t m = std::max(kW, kH); m > 1; m >>= 1) {
+        ++levels;
+    }
+    WGPUTextureDescriptor texDesc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    texDesc.label = {"Better Water wave texture", WGPU_STRLEN};
+    texDesc.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+    texDesc.dimension = WGPUTextureDimension_2D;
+    texDesc.size = {kW, kH, 1};
+    texDesc.format = WGPUTextureFormat_R8Unorm;
+    texDesc.mipLevelCount = levels;
+    texDesc.sampleCount = 1;
+    g_waveTex = wgpuDeviceCreateTexture(g_deviceInfo.device, &texDesc);
+    if (g_waveTex == nullptr) {
+        return false;
+    }
+
+    std::vector<uint8_t> level(static_cast<const uint8_t*>(g_waveRaw.data),
+        static_cast<const uint8_t*>(g_waveRaw.data) + kW * kH);
+    uint32_t w = kW;
+    uint32_t h = kH;
+    for (uint32_t mip = 0; mip < levels; ++mip) {
+        WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+        dst.texture = g_waveTex;
+        dst.mipLevel = mip;
+        dst.aspect = WGPUTextureAspect_All;
+        WGPUTexelCopyBufferLayout layout = WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT;
+        layout.offset = 0;
+        layout.bytesPerRow = w;
+        layout.rowsPerImage = h;
+        WGPUExtent3D size = {w, h, 1};
+        wgpuQueueWriteTexture(g_deviceInfo.queue, &dst, level.data(), level.size(), &layout, &size);
+
+        const uint32_t nw = std::max(w / 2, 1u);
+        const uint32_t nh = std::max(h / 2, 1u);
+        std::vector<uint8_t> next(static_cast<size_t>(nw) * nh);
+        for (uint32_t y = 0; y < nh; ++y) {
+            for (uint32_t x = 0; x < nw; ++x) {
+                const uint32_t x1 = std::min(x * 2 + 1, w - 1);
+                const uint32_t y1 = std::min(y * 2 + 1, h - 1);
+                const uint32_t sum = level[y * 2 * w + x * 2] + level[y * 2 * w + x1] +
+                                     level[y1 * w + x * 2] + level[y1 * w + x1];
+                next[y * nw + x] = static_cast<uint8_t>((sum + 2) / 4);
+            }
+        }
+        level = std::move(next);
+        w = nw;
+        h = nh;
+    }
+    g_waveView = wgpuTextureCreateView(g_waveTex, nullptr);
+    return g_waveView != nullptr;
+}
+
 void set4(float (&dst)[4], float a, float b, float c, float d) {
     dst[0] = a;
     dst[1] = b;
@@ -442,52 +665,13 @@ void set_color(float (&dst)[4], const GXColorS10& c) {
         std::clamp(c.b / 255.0f, 0.0f, 1.0f), 1.0f);
 }
 
-// Game thread, after opaque scene draws and before translucent overlays (including stock water).
-void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) {
-    if (!get_bool_option(g_cvarEnabled, true)) {
-        return;
-    }
-    if (stageCtx == nullptr || stageCtx->struct_size < sizeof(GfxStageContext) ||
-        stageCtx->game_view == nullptr || g_drawType == 0)
-    {
-        return;
-    }
-
-    CameraInfo camera = CAMERA_INFO_INIT;
-    if (svc_camera->get_camera(mod_ctx, stageCtx->game_view, &camera) != MOD_OK) {
-        return;
-    }
-
-    float playerY = camera.eye[1];
-    if (fopAc_ac_c* player = dComIfGp_getPlayer(0)) {
-        playerY = player->current.pos.y;
-    }
-    const bool fineOpen = update_lattice(g_fine, g_snapshot.data(), camera, playerY);
-    const bool coarseOpen = update_lattice(
-        g_coarse, g_snapshot.data() + kLatticeWidth * kLatticeWidth, camera, playerY);
-    // Nothing open nearby: skip the draw entirely.
-    if (!fineOpen && !coarseOpen) {
-        return;
-    }
-
-    GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
-    resolveDesc.color = true;
-    resolveDesc.depth = true;
-    GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
-    if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
-        resolved.depth == nullptr || resolved.color == nullptr)
-    {
-        if (!g_warnedNoResolve) {
-            g_warnedNoResolve = true;
-            svc_log->warn(mod_ctx, "scene snapshots unavailable yet; water waits");
-        }
-        return;
-    }
-
+float elapsed_seconds() {
     static const auto kStart = std::chrono::steady_clock::now();
-    const float time = std::chrono::duration<float>(std::chrono::steady_clock::now() - kStart).count();
+    return std::chrono::duration<float>(std::chrono::steady_clock::now() - kStart).count();
+}
 
-    Uniforms uni{};
+void fill_uniforms(Uniforms& uni, const CameraInfo& camera, uint32_t width, uint32_t height) {
+    const float time = elapsed_seconds();
     std::memcpy(uni.proj_from_world, camera.proj_from_world, sizeof(uni.proj_from_world));
     std::memcpy(uni.world_from_proj, camera.world_from_proj, sizeof(uni.world_from_proj));
     set4(uni.eye, camera.eye[0], camera.eye[1], camera.eye[2], 1.0f);
@@ -534,9 +718,87 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const float half = static_cast<float>(kGridQuads) * 0.5f;
     const float reach = static_cast<float>(kLatticeWidth) * kCoarseCell * 0.5f;
     const float warpB = (reach - kGridStep * half) / (half * half);
-    set4(uni.warp, kGridStep, warpB, kFineRadius, 0.0f);
-    set4(uni.screen, static_cast<float>(resolved.width), static_cast<float>(resolved.height),
+    set4(uni.warp, kGridStep, warpB, kFineRadius, g_deviceInfo.uses_reversed_z ? 1.0f : 0.0f);
+    set4(uni.screen, static_cast<float>(width), static_cast<float>(height),
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarDebug, 0), 0, 3)), clarity);
+
+    // Sunshine overlay (TMapObjWave). The game runs at 30 frames per second and advances each
+    // phase / scroll once per frame; the starting values are arbitrary (Sunshine randomizes them).
+    constexpr double kTwoPi = 6.28318;
+    const double frames = static_cast<double>(time) * 30.0;
+    const double phase1 = std::fmod(1.3 + 0.02 * frames, kTwoPi);
+    const double phase2 = std::fmod(4.1 + 0.03 * frames, kTwoPi);
+    const double scroll0 = std::fmod(0.30 + 0.0015 * frames, 1.0);
+    const double scroll1 = std::fmod(0.65 + 0.0015 * frames, 1.0);
+    set4(uni.sun0, g_framePlayer[0], g_framePlayer[2], static_cast<float>(phase1),
+        static_cast<float>(phase2));
+    // Default amplitudes from TMapObjWave::load (unk2C = 30, unk30 = 25).
+    set4(uni.sun1, 30.0f, 25.0f, static_cast<float>(scroll0), static_cast<float>(scroll1));
+    const float overlay =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarOverlay, 100), 0, 400)) /
+        100.0f;
+    set4(uni.sun2, 1.0f, 1.0f, 1.0f, overlay);
+}
+
+// Game thread, after opaque scene draws and before translucent overlays (including stock water).
+// Keeps the water lattices up to date; in "Custom surface" mode it also draws the surface.
+void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) {
+    g_frameValid = false;
+    if (!get_bool_option(g_cvarEnabled, true)) {
+        return;
+    }
+    if (stageCtx == nullptr || stageCtx->struct_size < sizeof(GfxStageContext) ||
+        stageCtx->game_view == nullptr || g_drawType == 0)
+    {
+        return;
+    }
+
+    CameraInfo camera = CAMERA_INFO_INIT;
+    if (svc_camera->get_camera(mod_ctx, stageCtx->game_view, &camera) != MOD_OK) {
+        return;
+    }
+
+    float playerY = camera.eye[1];
+    g_framePlayer[0] = camera.eye[0];
+    g_framePlayer[1] = camera.eye[1];
+    g_framePlayer[2] = camera.eye[2];
+    if (fopAc_ac_c* player = dComIfGp_getPlayer(0)) {
+        playerY = player->current.pos.y;
+        g_framePlayer[0] = player->current.pos.x;
+        g_framePlayer[1] = player->current.pos.y;
+        g_framePlayer[2] = player->current.pos.z;
+    }
+    const bool fineOpen = update_lattice(g_fine, g_snapshot.data(), camera, playerY);
+    const bool coarseOpen = update_lattice(
+        g_coarse, g_snapshot.data() + kLatticeWidth * kLatticeWidth, camera, playerY);
+    // Nothing open nearby: skip the draw entirely.
+    if (!fineOpen && !coarseOpen) {
+        return;
+    }
+
+    g_frameCamera = camera;
+    g_frameValid = true;
+
+    if (get_int_option(g_cvarMode, 0) != 1) {
+        return; // Sunshine mode draws from the before-HUD hook, after the stock water.
+    }
+
+    GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
+    resolveDesc.color = true;
+    resolveDesc.depth = true;
+    GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
+    if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
+        resolved.depth == nullptr || resolved.color == nullptr)
+    {
+        if (!g_warnedNoResolve) {
+            g_warnedNoResolve = true;
+            svc_log->warn(mod_ctx, "scene snapshots unavailable yet; water waits");
+        }
+        return;
+    }
+
+    Uniforms uni{};
+    fill_uniforms(uni, camera, resolved.width, resolved.height);
 
     GfxRange uniformRange{0, 0};
     GfxRange storageRange{0, 0};
@@ -560,6 +822,57 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     {
         g_loggedFirstDraw = true;
         svc_log->info(mod_ctx, "first water surface queued");
+    }
+}
+
+// Game thread, after the whole 3D scene (stock water included) and before the HUD: the Sunshine
+// wave overlay is drawn here, on top of the stock water, like TMapObjWave is in Sunshine.
+void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
+    if (!g_frameValid) {
+        return;
+    }
+    g_frameValid = false;
+    if (get_int_option(g_cvarMode, 0) == 1 || g_sunDrawType == 0) {
+        return;
+    }
+
+    GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
+    resolveDesc.color = false;
+    resolveDesc.depth = true;
+    GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
+    if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
+        resolved.depth == nullptr)
+    {
+        if (!g_warnedNoResolve) {
+            g_warnedNoResolve = true;
+            svc_log->warn(mod_ctx, "scene depth unavailable; wave overlay waits");
+        }
+        return;
+    }
+
+    Uniforms uni{};
+    fill_uniforms(uni, g_frameCamera, resolved.width, resolved.height);
+    GfxRange uniformRange{0, 0};
+    GfxRange storageRange{0, 0};
+    if (svc_gfx->push_uniform(mod_ctx, &uni, sizeof(uni), &uniformRange) != MOD_OK ||
+        svc_gfx->push_storage(mod_ctx, g_snapshot.data(), sizeof(g_snapshot), &storageRange) !=
+            MOD_OK)
+    {
+        return;
+    }
+
+    SunPayload payload{};
+    payload.depth = resolved.depth;
+    payload.uniform_offset = uniformRange.offset;
+    payload.uniform_size = uniformRange.size;
+    payload.storage_offset = storageRange.offset;
+    payload.storage_size = storageRange.size;
+    payload.vertex_count = kSunCols * kSunRows * 6u;
+    if (svc_gfx->push_draw(mod_ctx, g_sunDrawType, &payload, sizeof(payload)) == MOD_OK &&
+        !g_loggedFirstDraw)
+    {
+        g_loggedFirstDraw = true;
+        svc_log->info(mod_ctx, "first Sunshine wave overlay queued");
     }
 }
 
@@ -614,6 +927,21 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     control.config_var = g_cvarEnabled;
     svc_ui->pane_add_control(mod_ctx, panel, &control, nullptr);
 
+    static const char* kModeOptions[] = {"Sunshine waves", "Custom surface"};
+    control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_SELECT;
+    control.label = "Style";
+    control.help_rml = "Sunshine waves: the wave grid from Super Mario Sunshine drawn over the "
+                       "game's own water.<br/>Custom surface: an experimental replacement water "
+                       "surface with refraction and reflections.";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarMode;
+    control.options = kModeOptions;
+    control.option_count = 2;
+    svc_ui->pane_add_control(mod_ctx, panel, &control, nullptr);
+
+    add_number(panel, "Foam Intensity", "Brightness of the Sunshine wave foam.", g_cvarOverlay, 0,
+        400, 10, "%");
     add_number(panel, "Wave Height", "Size of the swell on open, deep water.", g_cvarWaveHeight, 0,
         300, 10, "%");
     add_number(panel, "Ripple Strength", "How strongly the surface ripples shade and reflect.",
@@ -646,13 +974,19 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return mods::set_error(error, result, "failed to load water shader");
     }
+    result = svc_resource->load(mod_ctx, "wave.raw", &g_waveRaw);
+    if (result != MOD_OK) {
+        return mods::set_error(error, result, "failed to load wave texture");
+    }
 
     if (register_bool_option("waterEnabled", true, g_cvarEnabled, error) != MOD_OK ||
         register_int_option("waveHeight", 100, g_cvarWaveHeight, error) != MOD_OK ||
         register_int_option("rippleStrength", 100, g_cvarNormals, error) != MOD_OK ||
         register_int_option("clarity", 100, g_cvarClarity, error) != MOD_OK ||
         register_int_option("distanceHaze", 100, g_cvarFog, error) != MOD_OK ||
-        register_int_option("debugView", 0, g_cvarDebug, error) != MOD_OK)
+        register_int_option("debugView", 0, g_cvarDebug, error) != MOD_OK ||
+        register_int_option("style", 0, g_cvarMode, error) != MOD_OK ||
+        register_int_option("foamIntensity", 100, g_cvarOverlay, error) != MOD_OK)
     {
         return MOD_ERROR;
     }
@@ -671,12 +1005,36 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (g_sampler == nullptr) {
         return mods::set_error(error, MOD_ERROR, "failed to create sampler");
     }
+    WGPUSamplerDescriptor repeatDesc = WGPU_SAMPLER_DESCRIPTOR_INIT;
+    repeatDesc.addressModeU = WGPUAddressMode_Repeat;
+    repeatDesc.addressModeV = WGPUAddressMode_Repeat;
+    repeatDesc.addressModeW = WGPUAddressMode_Repeat;
+    repeatDesc.magFilter = WGPUFilterMode_Linear;
+    repeatDesc.minFilter = WGPUFilterMode_Linear;
+    repeatDesc.mipmapFilter = WGPUMipmapFilterMode_Linear;
+    g_repeatSampler = wgpuDeviceCreateSampler(g_deviceInfo.device, &repeatDesc);
+    if (g_repeatSampler == nullptr || !create_wave_texture()) {
+        return mods::set_error(error, MOD_ERROR, "failed to create wave texture");
+    }
 
     GfxDrawTypeDesc drawDesc = GFX_DRAW_TYPE_DESC_INIT;
     drawDesc.label = "Better Water";
     drawDesc.draw = on_draw;
     if (svc_gfx->register_draw_type(mod_ctx, &drawDesc, &g_drawType) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register draw type");
+    }
+    GfxDrawTypeDesc sunDrawDesc = GFX_DRAW_TYPE_DESC_INIT;
+    sunDrawDesc.label = "Better Water (Sunshine waves)";
+    sunDrawDesc.draw = on_sun_draw;
+    if (svc_gfx->register_draw_type(mod_ctx, &sunDrawDesc, &g_sunDrawType) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register Sunshine draw type");
+    }
+    GfxStageHookDesc hudDesc = GFX_STAGE_HOOK_DESC_INIT;
+    hudDesc.callback = on_frame_before_hud;
+    if (svc_gfx->register_stage_hook(
+            mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &hudDesc, &g_hudHook) != MOD_OK)
+    {
+        return mods::set_error(error, MOD_ERROR, "failed to register before-HUD hook");
     }
     GfxStageHookDesc stageDesc = GFX_STAGE_HOOK_DESC_INIT;
     stageDesc.callback = on_scene_after_opaque;
@@ -700,14 +1058,29 @@ MOD_EXPORT ModResult mod_update(ModError*) {
 
 MOD_EXPORT ModResult mod_shutdown(ModError*) {
     svc_resource->free(mod_ctx, &g_shaderSource);
+    svc_resource->free(mod_ctx, &g_waveRaw);
     release_pipeline();
+    release_sun_pipeline();
+    if (g_waveView != nullptr) {
+        wgpuTextureViewRelease(g_waveView);
+        g_waveView = nullptr;
+    }
+    if (g_waveTex != nullptr) {
+        wgpuTextureRelease(g_waveTex);
+        g_waveTex = nullptr;
+    }
+    if (g_repeatSampler != nullptr) {
+        wgpuSamplerRelease(g_repeatSampler);
+        g_repeatSampler = nullptr;
+    }
     if (g_sampler != nullptr) {
         wgpuSamplerRelease(g_sampler);
         g_sampler = nullptr;
     }
     g_cvarEnabled = g_cvarWaveHeight = g_cvarNormals = g_cvarClarity = g_cvarFog = g_cvarDebug = 0;
-    g_drawType = 0;
-    g_stageHook = 0;
+    g_cvarMode = g_cvarOverlay = 0;
+    g_drawType = g_sunDrawType = 0;
+    g_stageHook = g_hudHook = 0;
     return MOD_OK;
 }
 }
