@@ -564,8 +564,16 @@ void on_draw(
         return;
     }
 
-    WGPUBindGroupEntry entries[5] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
-        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    if (g_waveView == nullptr || g_repeatSampler == nullptr) {
+        return;
+    }
+    WGPUBindGroupEntry entries[7] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    entries[5].binding = 5;
+    entries[5].textureView = g_waveView;
+    entries[6].binding = 6;
+    entries[6].sampler = g_repeatSampler;
     entries[0].binding = 0;
     entries[0].buffer = ctx->uniform_buffer;
     entries[0].offset = data.uniform_offset;
@@ -582,7 +590,7 @@ void on_draw(
     entries[4].sampler = g_sampler;
     WGPUBindGroupDescriptor bindDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bindDesc.layout = g_bindLayout;
-    bindDesc.entryCount = 5;
+    bindDesc.entryCount = 7;
     bindDesc.entries = entries;
     WGPUBindGroup group = wgpuDeviceCreateBindGroup(ctx->device, &bindDesc);
     if (group == nullptr) {
