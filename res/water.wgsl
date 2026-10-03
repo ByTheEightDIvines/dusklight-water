@@ -54,7 +54,7 @@ struct VOut {
 
 // Level 0 = fine lattice (near the camera), level 1 = coarse lattice (far reach). Both live in
 // one storage buffer: fine cells first, then coarse cells.
-const kStepLimit: f32 = 80.0;      // largest height difference blended or spanned by one surface quad
+const kStepLimit: f32 = 40.0;      // largest height difference blended or spanned by one surface quad
 
 fn use_fine(xz: vec2f) -> bool {
     let d = max(abs(xz.x - u.eye.x), abs(xz.y - u.eye.z));
@@ -195,6 +195,14 @@ fn glints(p: vec2f, dist: f32, t: f32, R: vec3f, L: vec3f) -> f32 {
         s = s + w3 * glint_band(p, 180.0, t, R, L, 2.0);
     }
     return s;
+}
+
+// 1 when the nearest lattice cell was grown into a shallow without water collision.
+fn cell_fill(xz: vec2f) -> f32 {
+    if use_fine(xz) {
+        return cell_at(0, i32(floor(xz.x / u.lat.w) - u.lat.x), i32(floor(xz.y / u.lat.w) - u.lat.y)).w;
+    }
+    return cell_at(1, i32(floor(xz.x / u.lat2.w) - u.lat2.x), i32(floor(xz.y / u.lat2.w) - u.lat2.y)).w;
 }
 
 // Nearest-cell lattice read: (height, is wet).
@@ -479,6 +487,10 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
         return vec4f(textureSampleLevel(scene_color, samp, uv, 0.0).rgb, 1.0);
     }
     var thick0 = max(world.y - scene0.y, 0.0);
+    // Grown cells (no water collision here) are only water over a genuinely shallow bed.
+    if cell_fill(world.xz) > 0.5 && thick0 > 100.0 {
+        discard;
+    }
     if length(scene0 - eye) > 60000.0 {
         thick0 = 2000.0;
     }

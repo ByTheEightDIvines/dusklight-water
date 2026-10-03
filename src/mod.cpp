@@ -279,8 +279,55 @@ bool build_snapshot(Lattice& lat, std::array<float, 4>* out) {
         }
     }
 
+    // Fill: the stock water plane is drawn over shallows that carry no water collision (sandbars,
+    // shelves), which would leave holes in the replaced water. Grow the wet cells outward a few
+    // cells; the shader only draws the grown cells where the bed really is shallow, and the
+    // terrain test removes them over dry land.
+    std::array<uint8_t, W * W> filled{};
+    const int iterations = lat.cellSize < 100.0f ? 8 : 4;
+    for (int it = 0; it < iterations; ++it) {
+        std::array<uint8_t, W * W> nState = state;
+        std::array<float, W * W> nHeight = height;
+        std::array<float, W * W> nDepth = depth;
+        std::array<uint8_t, W * W> nFilled = filled;
+        for (int j = 0; j < W; ++j) {
+            for (int i = 0; i < W; ++i) {
+                const int idx = j * W + i;
+                if (state[idx] != 0) {
+                    continue;
+                }
+                static const int kDx[4] = {1, -1, 0, 0};
+                static const int kDz[4] = {0, 0, 1, -1};
+                float hsum = 0.0f;
+                int count = 0;
+                uint8_t best = 0;
+                for (int k = 0; k < 4; ++k) {
+                    const int ni = i + kDx[k];
+                    const int nj = j + kDz[k];
+                    if (ni < 0 || nj < 0 || ni >= W || nj >= W || state[nj * W + ni] == 0) {
+                        continue;
+                    }
+                    hsum += height[nj * W + ni];
+                    best = std::max(best, state[nj * W + ni]);
+                    ++count;
+                }
+                if (count > 0) {
+                    nState[idx] = best;
+                    nHeight[idx] = hsum / static_cast<float>(count);
+                    nDepth[idx] = 30.0f;
+                    nFilled[idx] = 1;
+                }
+            }
+        }
+        state = nState;
+        height = nHeight;
+        depth = nDepth;
+        filled = nFilled;
+    }
+
     for (int idx = 0; idx < W * W; ++idx) {
-        out[idx] = {height[idx], depth[idx], static_cast<float>(state[idx]), 0.0f};
+        out[idx] = {height[idx], depth[idx], static_cast<float>(state[idx]),
+            filled[idx] != 0 ? 1.0f : 0.0f};
     }
     return anyOpen;
 }
@@ -332,7 +379,7 @@ void update_spray(const CameraInfo& camera) {
     for (int j = 1; j < W - 1; ++j) {
         for (int i = 1; i < W - 1; ++i) {
             const std::array<float, 4>& c = tier[j * W + i];
-            if (c[2] < 0.5f) {
+            if (c[2] < 0.5f || c[3] > 0.5f) {
                 continue;
             }
             static const int kDx[4] = {1, -1, 0, 0};
@@ -340,7 +387,7 @@ void update_spray(const CameraInfo& camera) {
             for (int k = 0; k < 4; ++k) {
                 const std::array<float, 4>& nb = tier[(j + kDz[k]) * W + (i + kDx[k])];
                 const float step = nb[0] - c[0];
-                if (nb[2] < 0.5f || step < 40.0f || step > 700.0f) {
+                if (nb[2] < 0.5f || nb[3] > 0.5f || step < 40.0f || step > 700.0f) {
                     continue;
                 }
                 const float x = (static_cast<float>(g_fine.ix0 + i) + 0.5f + 0.5f * kDx[k]) * kFineCell;
