@@ -442,6 +442,8 @@ struct SunOut {
     @location(0) uv0: vec2f,
     @location(1) uv1: vec2f,
     @location(2) va: f32,
+    @location(3) wp: vec2f,
+    @location(4) crest: f32,
 }
 
 @vertex
@@ -464,6 +466,8 @@ fn vs_sun(@builtin(vertex_index) vi: u32) -> SunOut {
         o.uv0 = vec2f(0.0);
         o.uv1 = vec2f(0.0);
         o.va = 0.0;
+        o.wp = vec2f(0.0);
+        o.crest = 0.0;
         return o;
     }
     // TMapObjWave::updateHeightAndAlpha: swell and alpha shrink toward the shore.
@@ -486,6 +490,9 @@ fn vs_sun(@builtin(vertex_index) vi: u32) -> SunOut {
     let fade = floor(255.0 * (1.0 - (1.0 / SUN_HALF) * max(abs(xo), abs(zo)))) / 255.0;
     o.va = clamp(fade, 0.0, 1.0) * clamp(depth / 150.0, 0.0, 1.0);
 
+    o.wp = vec2f(x, z);
+    // Foam collects on the swell crests rather than covering the whole sea evenly.
+    o.crest = smoothstep(-0.25, 0.75, h / max(u.sun1.x + u.sun1.y, 1.0));
     o.uv0 = vec2f(x * 0.0012 + u.sun1.z, z * 0.0012);
     o.uv1 = vec2f(x * 0.0012, u.sun1.w + z * 0.0015);
     return o;
@@ -494,8 +501,9 @@ fn vs_sun(@builtin(vertex_index) vi: u32) -> SunOut {
 @fragment
 fn fs_sun(in: SunOut) -> @location(0) vec4f {
     // Low-frequency warp of the texture coordinates breaks up the obvious tiling lattice.
-    let wp0 = in.uv0 + (vec2f(vnoise(in.uv0 * 3.1), vnoise(in.uv0 * 3.1 + 7.3)) - 0.5) * 0.45;
-    let wp1 = in.uv1 + (vec2f(vnoise(in.uv1 * 2.7 + 3.9), vnoise(in.uv1 * 2.7 + 11.1)) - 0.5) * 0.45;
+    let wt = u.params.x * 0.02;
+    let wp0 = in.uv0 + (vec2f(vnoise(in.uv0 * 3.1 + wt), vnoise(in.uv0 * 3.1 + 7.3 - wt)) - 0.5) * 0.45;
+    let wp1 = in.uv1 + (vec2f(vnoise(in.uv1 * 2.7 + 3.9 - wt), vnoise(in.uv1 * 2.7 + 11.1 + wt)) - 0.5) * 0.45;
     let t0 = textureSample(wave_tex, wave_samp, wp0).r;
     let t1 = textureSample(wave_tex, wave_samp, wp1).r;
 
@@ -526,6 +534,11 @@ fn fs_sun(in: SunOut) -> @location(0) vec4f {
     }
     // Far specks only alias into rows; fade them out with distance.
     vis = vis * (1.0 - smoothstep(1500.0, 5000.0, in.pos.w));
+    // Patchy, drifting coverage (world-space noise moving at its own pace) on top of the crests,
+    // so the specks are not a uniform sheet scrolling in one direction.
+    let tm = u.params.x;
+    let patch = smoothstep(0.42, 0.72, fbm(in.wp * 0.0011 + vec2f(tm * 0.011, -tm * 0.007)));
+    vis = vis * in.crest * mix(0.08, 1.0, patch);
     // RASC * 2 clamps to white; the tint lets the colour be adjusted later.
     let colour = clamp(vec3f(200.0, 200.0, 255.0) / 255.0 * 2.0, vec3f(0.0), vec3f(1.0)) * vec3f(1.0);
     return vec4f(colour, a * vis * u.sun2.w);
