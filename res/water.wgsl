@@ -207,13 +207,14 @@ fn cell_h(xz: vec2f) -> vec2f {
 // in the lattice as a ledge of water much higher than the pool below it; the field is a smooth
 // weighted count of such ledge cells around the point, so its contours are rings about the foot.
 fn fall_field(xz: vec2f, y: f32) -> f32 {
+    let jit = hash21(floor(xz * 0.25)) * 1.047198; // dithers the cell-sized steps of the lattice
     var acc = 0.0;
     var tot = 0.0;
     for (var r = 0u; r < 3u; r = r + 1u) {
         let rad = 55.0 + 50.0 * f32(r);
         let wgt = 1.0 - 0.35 * f32(r);
         for (var k = 0u; k < 6u; k = k + 1u) {
-            let ang = f32(k) * 1.047198;
+            let ang = f32(k) * 1.047198 + jit;
             let hc = cell_h(xz + vec2f(cos(ang), sin(ang)) * rad);
             if hc.y > 0.5 && hc.x > y + kStepLimit {
                 acc = acc + wgt;
@@ -460,8 +461,17 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let scene0 = unproject(uv, d0);
     // Terrain above the surface (a beach, a rock face) is not water: without this the cover that
     // hides the stock plane draws the water as a glassy lip over the shore.
+    var terrain_above = false;
     if u.eye.y >= world.y && scene0.y > world.y + 1.0 + dist * 0.002 && length(scene0 - eye) < 60000.0 {
-        discard;
+        if scene0.y > world.y + 40.0 {
+            discard;
+        }
+        terrain_above = true;
+    }
+    if terrain_above {
+        // Shore band: show the scene as it is, but still claim the depth so the stock water's own
+        // rim cannot draw a dark line over it.
+        return vec4f(textureSampleLevel(scene_color, samp, uv, 0.0).rgb, 1.0);
     }
     var thick0 = max(world.y - scene0.y, 0.0);
     if length(scene0 - eye) > 60000.0 {
@@ -546,7 +556,10 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
         foam = 0.0;
     }
     foam = clamp(foam, 0.0, 1.0);
-    col = mix(col, vec3f(0.92, 0.96, 0.98) * (0.35 + 0.65 * lum), foam);
+    // Foam must read as white against whatever is under it, including sunlit sand that is brighter
+    // than the ambient-scaled foam colour: it is never darker than the scene plus a little.
+    let foam_col = clamp(max(vec3f(0.92, 0.96, 0.98) * (0.60 + 0.40 * lum), under * 1.08 + vec3f(0.10)), vec3f(0.0), vec3f(1.0));
+    col = mix(col, foam_col, foam);
 
     // Waterfall foot: churning white splash, with brighter rings where the ripples crest.
     if fall > 0.001 {
@@ -554,7 +567,7 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
                                             fbm(world.xz * 0.41 - vec2f(t * 1.6, t * 0.6)) * 0.45);
         let crest = smoothstep(0.88, 1.0, fall_ring) * 0.35;
         let splash = clamp(fall * (0.10 + 0.90 * churn) + fall * crest, 0.0, 1.0);
-        col = mix(col, vec3f(0.94, 0.97, 0.99) * (0.40 + 0.60 * lum), splash * 0.65);
+        col = mix(col, clamp(max(vec3f(0.94, 0.97, 0.99) * (0.60 + 0.40 * lum), under * 1.08 + vec3f(0.10)), vec3f(0.0), vec3f(1.0)), splash * 0.5);
     }
 
     // Wave texture: thin pale contour lines that trace the swell and stretch along the crests, as
