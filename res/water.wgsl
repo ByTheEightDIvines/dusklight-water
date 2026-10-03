@@ -190,6 +190,38 @@ fn glints(p: vec2f, dist: f32, t: f32, R: vec3f, L: vec3f) -> f32 {
     return s;
 }
 
+// Nearest-cell lattice read: (height, is wet).
+fn cell_h(xz: vec2f) -> vec2f {
+    var c: vec4f;
+    if use_fine(xz) {
+        c = cell_at(0, i32(floor(xz.x / u.lat.w) - u.lat.x), i32(floor(xz.y / u.lat.w) - u.lat.y));
+    } else {
+        c = cell_at(1, i32(floor(xz.x / u.lat2.w) - u.lat2.x), i32(floor(xz.y / u.lat2.w) - u.lat2.y));
+    }
+    return vec2f(c.x, select(0.0, 1.0, c.z > 0.5));
+}
+
+// Waterfall field: 0 far from any drop, rising toward 1 at the foot of a fall. A waterfall shows up
+// in the lattice as a ledge of water much higher than the pool below it; the field is a smooth
+// weighted count of such ledge cells around the point, so its contours are rings about the foot.
+fn fall_field(xz: vec2f, y: f32) -> f32 {
+    var acc = 0.0;
+    var tot = 0.0;
+    for (var r = 0u; r < 3u; r = r + 1u) {
+        let rad = 60.0 + 85.0 * f32(r);
+        let wgt = 1.0 - 0.28 * f32(r);
+        for (var k = 0u; k < 6u; k = k + 1u) {
+            let ang = f32(k) * 1.047198;
+            let hc = cell_h(xz + vec2f(cos(ang), sin(ang)) * rad);
+            if hc.y > 0.5 && hc.x > y + kStepLimit {
+                acc = acc + wgt;
+            }
+            tot = tot + wgt;
+        }
+    }
+    return acc / tot;
+}
+
 fn amplitude_scale(open: f32, depth: f32) -> f32 {
     return u.params.y * open * smoothstep(40.0, 320.0, depth);
 }
@@ -380,6 +412,10 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let ripple_fade = 1.0 - smoothstep(300.0, 2500.0, dist);
     let ripple = (vnoise(world.xz * 0.05 + vec2f(t * 0.4, -t * 0.3)) - 0.5) * ripple_fade * (0.75 + 0.6 * dens);
     let ripple2 = (vnoise(world.xz * 0.11 - vec2f(t * 0.5, t * 0.2)) - 0.5) * ripple_fade * (0.75 + 0.6 * dens);
+    var fall = 0.0;
+    if u.eye.y >= world.y && !stagnant {
+        fall = clamp(fall_field(world.xz, info.x) * 2.4, 0.0, 1.0);
+    }
     let hi_fade = (1.0 - smoothstep(250.0, 1400.0, dist)) * (0.45 + 1.25 * dens);
     let ripple3 = (vnoise(world.xz * 0.23 + vec2f(-t * 0.7, t * 0.5)) - 0.5) * hi_fade;
     let ripple4 = (vnoise(world.xz * 0.47 + vec2f(t * 0.6, t * 0.8)) - 0.5) * hi_fade;
@@ -387,6 +423,11 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let calm = select(1.0, 0.3, stagnant);
     var N = normalize(vec3f(-w.y * strength - (ripple + ripple3 * 1.1) * 0.05 * calm, 1.0, -w.z * strength - (ripple2 + ripple4 * 1.1) * 0.05 * calm));
     var N_low = normalize(vec3f(-w_low.y * strength, 1.0, -w_low.z * strength));
+
+    // Waterfall foot: ripples spreading outward as ring contours of the fall field.
+    let fall_ring = sin(fall * 14.0 - t * 3.6 + vnoise(world.xz * 0.03) * 2.0);
+    N = normalize(vec3f(N.x + fall_ring * 0.10 * fall, N.y, N.z + fall_ring * 0.07 * fall));
+    N_low = normalize(vec3f(N_low.x + fall_ring * 0.05 * fall, N_low.y, N_low.z + fall_ring * 0.04 * fall));
 
     // Footsteps and swimming: a turbulent swirl around Link, like the stock spring ripples. It
     // warps the reflection normal and what is seen through the water.
@@ -489,6 +530,15 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     }
     foam = clamp(foam, 0.0, 1.0);
     col = mix(col, vec3f(0.92, 0.96, 0.98) * (0.35 + 0.65 * lum), foam);
+
+    // Waterfall foot: churning white splash, with brighter rings where the ripples crest.
+    if fall > 0.001 {
+        let churn = smoothstep(0.32, 0.70, fbm(world.xz * 0.075 + vec2f(t * 0.9, -t * 0.7)) * 0.7 +
+                                            fbm(world.xz * 0.19 - vec2f(t * 1.3, t * 0.5)) * 0.4);
+        let crest = smoothstep(0.80, 1.0, fall_ring) * 0.5;
+        let splash = clamp(fall * (0.30 + 0.70 * churn) + fall * crest, 0.0, 1.0);
+        col = mix(col, vec3f(0.94, 0.97, 0.99) * (0.40 + 0.60 * lum), splash * 0.9);
+    }
 
     // Wave texture: thin pale contour lines that trace the swell and stretch along the crests, as
     // in Sunshine's sea. They are contours of the actual wave height, wandered by a slow noise so
