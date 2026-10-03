@@ -19,6 +19,7 @@
 #include "mods/svc/camera.h"
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
+#include "mods/svc/hook.hpp"
 #include "mods/svc/log.h"
 #include "mods/svc/resource.h"
 #include "mods/svc/ui.h"
@@ -47,6 +48,7 @@ IMPORT_SERVICE(ResourceService, svc_resource);
 IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(GfxService, svc_gfx);
 IMPORT_SERVICE(CameraService, svc_camera);
+IMPORT_SERVICE(HookService, svc_hook);
 
 namespace {
 
@@ -66,6 +68,7 @@ constexpr int kPuddleMinCells = 6;         // ...and so are patches smaller than
 constexpr float kSameBodyHeightTol = 30.0f; // neighbours within this height difference are one body
 
 ConfigVarHandle g_cvarEnabled = 0;
+ConfigVarHandle g_cvarSwim = 0;
 ConfigVarHandle g_cvarWaveHeight = 0;
 ConfigVarHandle g_cvarNormals = 0;
 ConfigVarHandle g_cvarClarity = 0;
@@ -130,6 +133,7 @@ Lattice g_fine{kFineCell, kFineBudget, {}, 0, 0, 0};
 Lattice g_coarse{kCoarseCell, kCoarseBudget, {}, 0, 0, 0};
 // Fine tier then coarse tier, uploaded as one storage buffer.
 std::array<std::array<float, 4>, 2 * kLatticeWidth * kLatticeWidth> g_snapshot;
+bool g_inOwnProbe = false;  // our lattice probes must see the raw, flat water
 float g_lastWaterY = 0.0f;
 bool g_haveLastWaterY = false;
 
@@ -147,7 +151,10 @@ bool probe_water(float x, float y, float z, float& outHeight) {
     static dBgS_WtrChk chk;
     cXyz pos(x, y - 500.0f, z);
     chk.Set(pos, y + 500.0f);
-    if (!dComIfG_Bgsp().WaterChk(&chk)) {
+    g_inOwnProbe = true;
+    const bool hit = dComIfG_Bgsp().WaterChk(&chk);
+    g_inOwnProbe = false;
+    if (!hit) {
         return false;
     }
     if (dComIfG_Bgsp().GetPolyAtt0(chk) == 6) {
@@ -285,6 +292,131 @@ bool update_lattice(Lattice& lat, std::array<float, 4>* out, const CameraInfo& c
             lat.iz0 + static_cast<int>(idx / kLatticeWidth), playerY, camera.eye[1]);
     }
     return build_snapshot(lat, out);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Wave collision
+//
+// Every water height the game uses (Link swimming, floating items, splashes) comes out of
+// dBgS::SplGrpChk, which returns the flat height of the water triangle under a point. Wind Waker
+// keeps its sea mesh and its collision on one shared height function; here the same effect comes
+// from a post-hook that adds the wave height to that result on open water. The wave function is a
+// CPU mirror of waves() in res/water.wgsl and must stay in sync with it.
+// ---------------------------------------------------------------------------------------------
+float elapsed_seconds();
+int64_t get_int_option(ConfigVarHandle handle, int64_t fallback);
+bool get_bool_option(ConfigVarHandle handle, bool fallback);
+
+constexpr float kBaseAmplitude = 12.0f;
+constexpr float kBaseWavelength = 900.0f;
+constexpr float kSwellScale = 0.6f;
+constexpr int kWaveCountVertex = 4;
+
+bool g_snapshotReady = false;
+float g_collisionEye[2] = {0.0f, 0.0f};
+
+float smoothstep_f(float a, float b, float x) {
+    const float t = std::clamp((x - a) / (b - a), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// Mirror of the shader's waves(): sum of Sunshine's two swells and the sharp-crested octaves.
+float cpu_wave_height(float x, float z, float t) {
+    constexpr double kTwoPi = 6.28318;
+    const double frames = static_cast<double>(t) * 30.0;
+    const double phase1 = std::fmod(1.3 + 0.02 * frames, kTwoPi);
+    const double phase2 = std::fmod(4.1 + 0.03 * frames, kTwoPi);
+    const double k1 = 0.02 / 6.28318;
+    const double k2 = 0.03 / 6.28318;
+    double h = 30.0 * kSwellScale * std::sin(k1 * x + phase1) +
+               25.0 * kSwellScale * std::sin(k2 * z + phase2);
+    for (int i = 0; i < kWaveCountVertex; ++i) {
+        const double angle = 0.6 + i * 2.399963;
+        const double dx = std::cos(angle);
+        const double dz = std::sin(angle);
+        const double wl = kBaseWavelength * std::pow(0.55, i);
+        const double k = 6.2831853 / wl;
+        const double omega = std::sqrt(980.0 * k) * 0.6;
+        const double amp = kBaseAmplitude * std::pow(0.62, i);
+        const double th = k * (dx * x + dz * z) - omega * t + i * 1.7;
+        h += amp * (std::exp(std::sin(th) - 1.0) - 0.466);
+    }
+    return static_cast<float>(h);
+}
+
+// Mirror of surface_info(): bilinear (height, depth, openness) from the uploaded snapshot.
+bool cpu_surface_info(float x, float z, float& openness, float& depth) {
+    const bool fine = std::max(std::fabs(x - g_collisionEye[0]), std::fabs(z - g_collisionEye[1])) <
+                      kFineRadius;
+    const Lattice& lat = fine ? g_fine : g_coarse;
+    const std::array<float, 4>* tier = g_snapshot.data() + (fine ? 0 : kLatticeWidth * kLatticeWidth);
+    const float cx = x / lat.cellSize - static_cast<float>(lat.ix0) - 0.5f;
+    const float cz = z / lat.cellSize - static_cast<float>(lat.iz0) - 0.5f;
+    const float bx = std::floor(cx);
+    const float bz = std::floor(cz);
+    const float fx = cx - bx;
+    const float fz = cz - bz;
+    const int ix = static_cast<int>(bx);
+    const int iz = static_cast<int>(bz);
+    const float w[4] = {(1 - fx) * (1 - fz), fx * (1 - fz), (1 - fx) * fz, fx * fz};
+    const int di[4] = {0, 1, 0, 1};
+    const int dj[4] = {0, 0, 1, 1};
+    float sum = 0.0f;
+    float d = 0.0f;
+    float open = 0.0f;
+    for (int n = 0; n < 4; ++n) {
+        const int i = ix + di[n];
+        const int j = iz + dj[n];
+        if (i < 0 || j < 0 || i >= kLatticeWidth || j >= kLatticeWidth) {
+            continue;
+        }
+        const std::array<float, 4>& c = tier[j * kLatticeWidth + i];
+        if (c[2] > 0.5f) {
+            sum += w[n];
+            d += c[1] * w[n];
+        }
+        if (c[2] > 1.5f) {
+            open += w[n];
+        }
+    }
+    if (sum < 1e-4f) {
+        return false;
+    }
+    openness = open;
+    depth = d / sum;
+    return open >= 0.01f;
+}
+
+DEFINE_HOOK(&dBgS::SplGrpChk, SplGrpCheck);
+
+void on_spl_grp_chk_post(ModContext*, void* args, void* retval, void*) {
+    if (g_inOwnProbe || !g_snapshotReady || retval == nullptr || !*static_cast<bool*>(retval)) {
+        return;
+    }
+    if (!get_bool_option(g_cvarEnabled, true) || !get_bool_option(g_cvarSwim, true) ||
+        get_int_option(g_cvarMode, 1) != 1)
+    {
+        return;
+    }
+    dBgS_SplGrpChk* chk = mods::arg<dBgS_SplGrpChk*>(args, 1);
+    if (chk == nullptr) {
+        return;
+    }
+    const float x = chk->GetPosP().x;
+    const float z = chk->GetPosP().z;
+    float openness = 0.0f;
+    float depth = 0.0f;
+    if (!cpu_surface_info(x, z, openness, depth)) {
+        return;
+    }
+    const float heightScale =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarWaveHeight, 100), 0, 300)) /
+        100.0f;
+    const float scale = heightScale * openness * smoothstep_f(40.0f, 320.0f, depth);
+    if (scale <= 0.0f) {
+        return;
+    }
+    chk->SetHeight(chk->GetHeight() + cpu_wave_height(x, z, elapsed_seconds()) * scale);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -808,6 +940,9 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
 
     g_frameCamera = camera;
     g_frameValid = true;
+    g_collisionEye[0] = camera.eye[0];
+    g_collisionEye[1] = camera.eye[2];
+    g_snapshotReady = true;
 
     if (get_int_option(g_cvarMode, 1) != 1) {
         return; // Sunshine mode draws from the before-HUD hook, after the stock water.
@@ -964,6 +1099,15 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     control.config_var = g_cvarEnabled;
     svc_ui->pane_add_control(mod_ctx, panel, &control, nullptr);
 
+    control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_TOGGLE;
+    control.label = "Waves move swimming height";
+    control.help_rml = "Link, items and splashes rise and fall with the waves on open water, like "
+                       "Wind Waker's sea. Only applies in Rolling waves style.";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarSwim;
+    svc_ui->pane_add_control(mod_ctx, panel, &control, nullptr);
+
     static const char* kModeOptions[] = {"Subtle overlay", "Rolling waves"};
     control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_SELECT;
@@ -1030,6 +1174,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     }
 
     if (register_bool_option("waterEnabled", true, g_cvarEnabled, error) != MOD_OK ||
+        register_bool_option("wavesMoveSwimming", true, g_cvarSwim, error) != MOD_OK ||
         register_int_option("waveHeight", 100, g_cvarWaveHeight, error) != MOD_OK ||
         register_int_option("rippleStrength", 100, g_cvarNormals, error) != MOD_OK ||
         register_int_option("clarity", 100, g_cvarClarity, error) != MOD_OK ||
@@ -1081,6 +1226,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (svc_gfx->register_draw_type(mod_ctx, &sunDrawDesc, &g_sunDrawType) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register Sunshine draw type");
     }
+    // Wave collision: add the wave height to the game's water height queries on open water.
+    if (mods::hook::add_post<SplGrpCheck>(on_spl_grp_chk_post) != MOD_OK) {
+        svc_log->warn(mod_ctx, "could not hook water collision; swimming height stays flat");
+    }
     GfxStageHookDesc hudDesc = GFX_STAGE_HOOK_DESC_INIT;
     hudDesc.callback = on_frame_before_hud;
     if (svc_gfx->register_stage_hook(
@@ -1129,7 +1278,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         wgpuSamplerRelease(g_sampler);
         g_sampler = nullptr;
     }
-    g_cvarEnabled = g_cvarWaveHeight = g_cvarNormals = g_cvarClarity = g_cvarFog = g_cvarDebug = 0;
+    g_cvarSwim = g_cvarEnabled = g_cvarWaveHeight = g_cvarNormals = g_cvarClarity = g_cvarFog = g_cvarDebug = 0;
     g_cvarMode = g_cvarOverlay = g_cvarRefract = g_cvarColor = 0;
     g_drawType = g_sunDrawType = 0;
     g_stageHook = g_hudHook = 0;
