@@ -284,7 +284,8 @@ bool build_snapshot(Lattice& lat, std::array<float, 4>* out) {
     // cells; the shader only draws the grown cells where the bed really is shallow, and the
     // terrain test removes them over dry land.
     std::array<uint8_t, W * W> filled{};
-    const int iterations = lat.cellSize < 100.0f ? 8 : 4;
+    // Disabled: the holes it was meant for turned out to be something else.
+    const int iterations = 0;
     for (int it = 0; it < iterations; ++it) {
         std::array<uint8_t, W * W> nState = state;
         std::array<float, W * W> nHeight = height;

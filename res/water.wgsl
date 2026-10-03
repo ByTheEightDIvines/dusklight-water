@@ -45,7 +45,7 @@ const BASE_WAVELENGTH: f32 = 900.0;
 const SWELL_SCALE: f32 = 0.72;      // fraction of Sunshine's swell amplitude used by the custom surface
 const SURFACE_LIFT: f32 = 0.0;
 const COVER_SLOPE: f32 = 0.012;     // extra cover per unit of camera distance
-const COVER_LIFT: f32 = 12.0;       // depth is written as if the surface were at least this far above the stock water plane      // keeps the surface just above the stock water plane
+const COVER_LIFT: f32 = 22.0;       // depth is written as if the surface were at least this far above the stock water plane      // keeps the surface just above the stock water plane
 
 struct VOut {
     @builtin(position) pos: vec4f,
@@ -554,7 +554,11 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     col = col + vec3f(1.0, 0.95, 0.85) * spec * u.sun.w * lum;
 
     // Water tapers to nothing at the shoreline: the thinner it is, the more of the scene shows.
-    col = mix(under, col, smoothstep(0.0, 24.0, thick));
+    col = mix(under, col, smoothstep(0.0, 5.0, thick));
+    // Shallows still read as water, not bare ground: a veil of the water's own colour, so a shoal
+    // inside the lake does not look like a hole through to the lakebed.
+    let veil = 0.32 * smoothstep(3.0, 30.0, thick);
+    col = mix(col, shallow_col * (0.45 + 0.85 * lum), veil);
 
     // Foam: shoreline (thin water) and wave crests.
     let fn1 = fbm(world.xz * 0.045 + vec2f(t * 0.05, t * 0.03));
