@@ -157,6 +157,11 @@ bool probe_water(float x, float y, float z, float& outHeight) {
     return true;
 }
 
+// Height of the water Link is in or standing beside (or his own height when there is none). Water
+// surfaces far above this (cave ceilings, upper pools) are not part of the sea and are ignored.
+float g_refY = 0.0f;
+constexpr float kMaxAboveRef = 150.0f;
+
 float probe_depth(float x, float waterY, float z) {
     static dBgS_GndChk gnd;
     cXyz pos(x, waterY - 2.0f, z);
@@ -181,7 +186,7 @@ void probe_cell(Lattice& lat, int ix, int iz, float playerY, float eyeY) {
     const float* list = g_haveLastWaterY ? candidates : candidates + 1;
     for (int i = 0; i < count; ++i) {
         float h = 0.0f;
-        if (probe_water(x, list[i], z, h)) {
+        if (probe_water(x, list[i], z, h) && h <= g_refY + kMaxAboveRef) {
             cell.found = true;
             cell.height = h;
             cell.depth = probe_depth(x, h, z);
@@ -785,6 +790,13 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         g_framePlayer[0] = player->current.pos.x;
         g_framePlayer[1] = player->current.pos.y;
         g_framePlayer[2] = player->current.pos.z;
+    }
+    {
+        float refH = 0.0f;
+        g_refY = (probe_water(g_framePlayer[0], playerY, g_framePlayer[2], refH) &&
+                  refH <= playerY + 250.0f) ?
+                     refH :
+                     playerY;
     }
     const bool fineOpen = update_lattice(g_fine, g_snapshot.data(), camera, playerY);
     const bool coarseOpen = update_lattice(

@@ -537,8 +537,8 @@ fn fs_sun(in: SunOut) -> @location(0) vec4f {
     // Patchy, drifting coverage (world-space noise moving at its own pace) on top of the crests,
     // so the specks are not a uniform sheet scrolling in one direction.
     let tm = u.params.x;
-    let patch = smoothstep(0.42, 0.72, fbm(in.wp * 0.0011 + vec2f(tm * 0.011, -tm * 0.007)));
-    vis = vis * in.crest * mix(0.08, 1.0, patch);
+    let drift = smoothstep(0.42, 0.72, fbm(in.wp * 0.0011 + vec2f(tm * 0.011, -tm * 0.007)));
+    vis = vis * in.crest * mix(0.08, 1.0, drift);
     // RASC * 2 clamps to white; the tint lets the colour be adjusted later.
     let colour = clamp(vec3f(200.0, 200.0, 255.0) / 255.0 * 2.0, vec3f(0.0), vec3f(1.0)) * vec3f(1.0);
     return vec4f(colour, a * vis * u.sun2.w);
