@@ -23,6 +23,7 @@ struct U {
     sun0: vec4f,     // Sunshine overlay: x,y centre (player) xz, z,w wave phases
     sun1: vec4f,     // Sunshine overlay: x,y wave amplitudes, z,w texture scroll
     sun2: vec4f,     // Sunshine overlay: xyz colour tint, w intensity
+    ripple: vec4f,   // x swim ripple intensity (0 = Link is not in the water)
 }
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -323,7 +324,21 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let ripple2 = (vnoise(world.xz * 0.11 - vec2f(t * 0.5, t * 0.2)) - 0.5) * ripple_fade;
     // N: full detail (glint, refraction). N_low: smooth normal for reflections and Fresnel.
     var N = normalize(vec3f(-w.y * strength - ripple * 0.05, 1.0, -w.z * strength - ripple2 * 0.05));
-    let N_low = normalize(vec3f(-w_low.y * strength, 1.0, -w_low.z * strength));
+    var N_low = normalize(vec3f(-w_low.y * strength, 1.0, -w_low.z * strength));
+
+    // Swim ripples: rings spreading out from Link while he is in the water.
+    var ring_foam = 0.0;
+    if u.ripple.x > 0.001 {
+        let pr = world.xz - u.sun0.xy;
+        let r = max(length(pr), 1.0);
+        let radial = pr / r;
+        let env = (1.0 - smoothstep(60.0, 650.0, r)) * smoothstep(25.0, 70.0, r) * u.ripple.x;
+        let ph = r * 0.05 - t * 5.0;
+        let slope = cos(ph) * 0.05 * env * 6.0;
+        N = normalize(vec3f(N.x - radial.x * slope, N.y, N.z - radial.y * slope));
+        N_low = normalize(vec3f(N_low.x - radial.x * slope * 0.6, N_low.y, N_low.z - radial.y * slope * 0.6));
+        ring_foam = smoothstep(0.88, 1.0, sin(ph)) * env * 0.35;
+    }
 
     let uv = frag.xy / u.screen.xy;
     let size = vec2i(u.screen.xy);
@@ -394,7 +409,7 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     var foam = shore * smoothstep(0.30, 0.70, fn1 * 0.6 + band * 0.55);
     // Shoreline foam only: it follows the Foam Intensity setting and is never drawn when looking
     // up at the water from underneath.
-    foam = foam * clamp(u.sun2.w, 0.0, 2.0);
+    foam = foam * clamp(u.sun2.w, 0.0, 2.0) + ring_foam;
     if u.eye.y < world.y {
         foam = 0.0;
     }
@@ -451,8 +466,14 @@ fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> FOut {
     o.depth = frag.z;
     // The cover grows with distance: depth precision falls off, and a thin cover lets the stock
     // water's sparkle texture z-fight through as a dotted grid on far water.
-    let plane_y = surface_info(world.xz).x + COVER_LIFT + length(world - u.eye.xyz) * COVER_SLOPE;
-    if world.y < plane_y {
+    let base_y = surface_info(world.xz).x;
+    let cover = COVER_LIFT + length(world - u.eye.xyz) * COVER_SLOPE;
+    // Seen from above the cover sits over the stock plane; seen from below (swimming, looking up)
+    // it sits under it, so the stock water's scrolling texture cannot show through either way.
+    let above = u.eye.y >= base_y;
+    let plane_y = select(base_y - cover, base_y + cover, above);
+    let behind_plane = select(world.y > plane_y, world.y < plane_y, above);
+    if behind_plane {
         let dir = normalize(world - u.eye.xyz);
         if abs(dir.y) > 1e-4 {
             let t = (plane_y - u.eye.y) / dir.y;

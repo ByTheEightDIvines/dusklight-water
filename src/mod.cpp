@@ -133,6 +133,7 @@ Lattice g_fine{kFineCell, kFineBudget, {}, 0, 0, 0};
 Lattice g_coarse{kCoarseCell, kCoarseBudget, {}, 0, 0, 0};
 // Fine tier then coarse tier, uploaded as one storage buffer.
 std::array<std::array<float, 4>, 2 * kLatticeWidth * kLatticeWidth> g_snapshot;
+float g_rippleIntensity = 0.0f; // swim ripple strength, smoothed
 bool g_inOwnProbe = false;  // our lattice probes must see the raw, flat water
 float g_lastWaterY = 0.0f;
 bool g_haveLastWaterY = false;
@@ -439,6 +440,7 @@ struct Uniforms {
     float sun0[4];
     float sun1[4];
     float sun2[4];
+    float ripple[4];
 };
 static_assert(sizeof(Uniforms) % 16 == 0);
 
@@ -891,6 +893,7 @@ void fill_uniforms(Uniforms& uni, const CameraInfo& camera, uint32_t width, uint
     const float refract =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRefract, 100), 0, 400)) /
         100.0f;
+    set4(uni.ripple, g_rippleIntensity, 0.0f, 0.0f, 0.0f);
     set4(uni.sun2, refract, get_int_option(g_cvarMode, 1) == 1 ? 1.0f : 0.0f,
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarColor, 0), 0, 2)), overlay);
 }
@@ -925,10 +928,26 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     }
     {
         float refH = 0.0f;
-        g_refY = (probe_water(g_framePlayer[0], playerY, g_framePlayer[2], refH) &&
-                  refH <= playerY + 250.0f) ?
-                     refH :
-                     playerY;
+        const bool inWaterZone = probe_water(g_framePlayer[0], playerY, g_framePlayer[2], refH) &&
+                                 refH <= playerY + 250.0f;
+        g_refY = inWaterZone ? refH : playerY;
+
+        // Swim ripples: on while Link is in or at the surface of the water, stronger when moving.
+        static float lastX = 0.0f;
+        static float lastZ = 0.0f;
+        static float lastT = -1.0f;
+        const float now = elapsed_seconds();
+        const float dt = now - lastT;
+        float speed = 0.0f;
+        if (lastT >= 0.0f && dt > 1e-4f && dt < 0.25f) {
+            speed = std::hypot(g_framePlayer[0] - lastX, g_framePlayer[2] - lastZ) / dt;
+        }
+        lastX = g_framePlayer[0];
+        lastZ = g_framePlayer[2];
+        lastT = now;
+        const bool swimming = inWaterZone && playerY <= refH + 30.0f && playerY >= refH - 250.0f;
+        const float target = swimming ? std::clamp(0.3f + speed / 250.0f, 0.3f, 1.0f) : 0.0f;
+        g_rippleIntensity += (target - g_rippleIntensity) * std::clamp(dt * 4.0f, 0.0f, 1.0f);
     }
     const bool fineOpen = update_lattice(g_fine, g_snapshot.data(), camera, playerY);
     const bool coarseOpen = update_lattice(
