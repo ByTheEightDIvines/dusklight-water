@@ -308,10 +308,11 @@ float elapsed_seconds();
 int64_t get_int_option(ConfigVarHandle handle, int64_t fallback);
 bool get_bool_option(ConfigVarHandle handle, bool fallback);
 
-constexpr float kBaseAmplitude = 12.0f;
+constexpr float kBaseAmplitude = 14.0f;
+constexpr double kWaveDecay = 0.70;
 constexpr float kBaseWavelength = 900.0f;
-constexpr float kSwellScale = 0.6f;
-constexpr int kWaveCountVertex = 4;
+constexpr float kSwellScale = 0.72f;
+constexpr int kWaveCountVertex = 5;
 
 bool g_snapshotReady = false;
 float g_collisionEye[2] = {0.0f, 0.0f};
@@ -338,7 +339,7 @@ float cpu_wave_height(float x, float z, float t) {
         const double wl = kBaseWavelength * std::pow(0.55, i);
         const double k = 6.2831853 / wl;
         const double omega = std::sqrt(980.0 * k) * 0.6;
-        const double amp = kBaseAmplitude * std::pow(0.62, i);
+        const double amp = kBaseAmplitude * std::pow(kWaveDecay, i);
         const double th = k * (dx * x + dz * z) - omega * t + i * 1.7;
         h += amp * (std::exp(std::sin(th) - 1.0) - 0.466);
     }

@@ -34,11 +34,12 @@ struct U {
 @group(0) @binding(5) var wave_tex: texture_2d<f32>;
 @group(0) @binding(6) var wave_samp: sampler;
 
-const WAVE_COUNT_VERTEX: i32 = 4;
+const WAVE_COUNT_VERTEX: i32 = 5;
 const WAVE_COUNT_FRAG: i32 = 8;
-const BASE_AMPLITUDE: f32 = 12.0;   // world units (1 unit is about 1 cm), scaled by params.y
+const BASE_AMPLITUDE: f32 = 14.0;
+const WAVE_DECAY: f32 = 0.70;       // amplitude ratio between successive octaves   // world units (1 unit is about 1 cm), scaled by params.y
 const BASE_WAVELENGTH: f32 = 900.0;
-const SWELL_SCALE: f32 = 0.6;       // fraction of Sunshine's swell amplitude used by the custom surface
+const SWELL_SCALE: f32 = 0.72;      // fraction of Sunshine's swell amplitude used by the custom surface
 const SURFACE_LIFT: f32 = 0.0;
 const COVER_SLOPE: f32 = 0.012;     // extra cover per unit of camera distance
 const COVER_LIFT: f32 = 12.0;       // depth is written as if the surface were at least this far above the stock water plane      // keeps the surface just above the stock water plane
@@ -131,7 +132,7 @@ fn waves(p: vec2f, t: f32, count: i32, dist: f32) -> vec3f {
         let omega = sqrt(980.0 * k) * 0.6;
         // Short waves fade with distance: the mesh gets coarser and they would only alias.
         let lod = 1.0 - smoothstep(wl * 5.0, wl * 25.0, dist);
-        let amp = BASE_AMPLITUDE * pow(0.62, fi) * lod;
+        let amp = BASE_AMPLITUDE * pow(WAVE_DECAY, fi) * lod;
         let th = k * dot(dir, p) - omega * t + fi * 1.7;
         let e = exp(sin(th) - 1.0);
         h = h + amp * (e - 0.466);
@@ -140,6 +141,21 @@ fn waves(p: vec2f, t: f32, count: i32, dist: f32) -> vec3f {
         dz = dz + d * dir.y;
     }
     return vec3f(h, dx, dz);
+}
+
+// Swim ripples: irregular rings spreading from Link (real height, so they catch light and reflect).
+fn ripple_h(p: vec2f, t: f32) -> f32 {
+    if u.ripple.x < 0.001 {
+        return 0.0;
+    }
+    let pr = p - u.sun0.xy;
+    let r0 = max(length(pr), 1.0);
+    let ang = atan2(pr.y, pr.x);
+    // The radius wobbles with direction and time, so the rings are never perfect circles.
+    let r = r0 + (24.0 * sin(3.0 * ang + t * 0.6) + 14.0 * sin(5.0 * ang - t * 0.8 + 1.7)) *
+                 smoothstep(40.0, 260.0, r0);
+    let env = (1.0 - smoothstep(80.0, 560.0, r0)) * smoothstep(30.0, 100.0, r0) * u.ripple.x;
+    return env * (3.5 * sin(r * 0.042 - t * 4.2) + 1.6 * sin(r * 0.083 - t * 6.6 + 1.0));
 }
 
 fn amplitude_scale(open: f32, depth: f32) -> f32 {
@@ -201,7 +217,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
     }
     let vdist = length(own - u.eye.xz);
     let w = waves(own, u.params.x, WAVE_COUNT_VERTEX, vdist);
-    let world = vec3f(own.x, base + SURFACE_LIFT + w.x * scale, own.y);
+    let world = vec3f(own.x, base + SURFACE_LIFT + w.x * scale + ripple_h(own, u.params.x) * select(0.0, 1.0, usable(info)), own.y);
     o.world = world;
     o.pos = u.proj_from_world * vec4f(world, 1.0);
     return o;
@@ -222,7 +238,8 @@ fn hash21(p: vec2f) -> f32 {
 fn vnoise(p: vec2f) -> f32 {
     let i = floor(p);
     let f = fract(p);
-    let s = f * f * (3.0 - 2.0 * f);
+    // Quintic interpolation: no visible cell grid, so foam edges stay round instead of blocky.
+    let s = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
     let a = hash21(i);
     let b = hash21(i + vec2f(1.0, 0.0));
     let c = hash21(i + vec2f(0.0, 1.0));
@@ -234,9 +251,11 @@ fn fbm(p: vec2f) -> f32 {
     var v = 0.0;
     var a = 0.5;
     var q = p;
+    // Each octave is rotated so the value-noise axes never line up.
+    let rot = mat2x2f(0.8, -0.6, 0.6, 0.8);
     for (var i = 0; i < 4; i = i + 1) {
         v = v + a * vnoise(q);
-        q = q * 2.03 + vec2f(17.1, 9.2);
+        q = rot * q * 2.03 + vec2f(17.1, 9.2);
         a = a * 0.5;
     }
     return v;
@@ -326,19 +345,13 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     var N = normalize(vec3f(-w.y * strength - ripple * 0.05, 1.0, -w.z * strength - ripple2 * 0.05));
     var N_low = normalize(vec3f(-w_low.y * strength, 1.0, -w_low.z * strength));
 
-    // Swim ripples: rings spreading out from Link while he is in the water.
-    var ring_foam = 0.0;
-    if u.ripple.x > 0.001 {
-        let pr = world.xz - u.sun0.xy;
-        let r = max(length(pr), 1.0);
-        let radial = pr / r;
-        let env = (1.0 - smoothstep(60.0, 650.0, r)) * smoothstep(25.0, 70.0, r) * u.ripple.x;
-        let ph = r * 0.05 - t * 5.0;
-        let slope = cos(ph) * 0.05 * env * 6.0;
-        N = normalize(vec3f(N.x - radial.x * slope, N.y, N.z - radial.y * slope));
-        N_low = normalize(vec3f(N_low.x - radial.x * slope * 0.6, N_low.y, N_low.z - radial.y * slope * 0.6));
-        ring_foam = smoothstep(0.88, 1.0, sin(ph)) * env * 0.35;
-    }
+    // Swim ripples also tilt the normals (finite differences of the ripple height).
+    let ripple_c = ripple_h(world.xz, t);
+    let ripple_gx = (ripple_h(world.xz + vec2f(6.0, 0.0), t) - ripple_c) / 6.0;
+    let ripple_gz = (ripple_h(world.xz + vec2f(0.0, 6.0), t) - ripple_c) / 6.0;
+    N = normalize(vec3f(N.x - ripple_gx * 0.8, N.y, N.z - ripple_gz * 0.8));
+    N_low = normalize(vec3f(N_low.x - ripple_gx * 0.5, N_low.y, N_low.z - ripple_gz * 0.5));
+    let ring_foam = 0.0;
 
     let uv = frag.xy / u.screen.xy;
     let size = vec2i(u.screen.xy);
@@ -406,7 +419,7 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let fn2 = fbm(world.xz * 0.11 - vec2f(t * 0.04, -t * 0.06));
     let shore = (1.0 - smoothstep(4.0, 55.0, thick)) * smoothstep(0.0, 6.0, thick + 3.0);
     let band = 0.5 + 0.5 * sin(thick * 0.14 - t * 1.3 + fn1 * 6.0);
-    var foam = shore * smoothstep(0.30, 0.70, fn1 * 0.6 + band * 0.55);
+    var foam = shore * smoothstep(0.22, 0.85, fn1 * 0.6 + band * 0.55);
     // Shoreline foam only: it follows the Foam Intensity setting and is never drawn when looking
     // up at the water from underneath.
     foam = foam * clamp(u.sun2.w, 0.0, 2.0) + ring_foam;
