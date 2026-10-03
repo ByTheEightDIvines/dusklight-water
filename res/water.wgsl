@@ -35,10 +35,11 @@ struct U {
 
 const WAVE_COUNT_VERTEX: i32 = 4;
 const WAVE_COUNT_FRAG: i32 = 8;
-const BASE_AMPLITUDE: f32 = 16.0;   // world units (1 unit is about 1 cm), scaled by params.y
+const BASE_AMPLITUDE: f32 = 12.0;   // world units (1 unit is about 1 cm), scaled by params.y
 const BASE_WAVELENGTH: f32 = 900.0;
-const SWELL_SCALE: f32 = 0.9;       // fraction of Sunshine's swell amplitude used by the custom surface
-const SURFACE_LIFT: f32 = 2.0;      // keeps the surface just above the stock water plane
+const SWELL_SCALE: f32 = 0.6;       // fraction of Sunshine's swell amplitude used by the custom surface
+const SURFACE_LIFT: f32 = 0.0;
+const COVER_LIFT: f32 = 10.0;       // depth is written as if the surface were at least this far above the stock water plane      // keeps the surface just above the stock water plane
 
 struct VOut {
     @builtin(position) pos: vec4f,
@@ -110,7 +111,7 @@ fn sun_swell(p: vec2f) -> vec3f {
     let a2 = u.sun1.y * SWELL_SCALE;
     let s1 = sin(k1 * p.x + u.sun0.z);
     let s2 = sin(k2 * p.y + u.sun0.w);
-    return vec3f(a1 * (s1 + 1.0) + a2 * (s2 + 1.0),
+    return vec3f(a1 * s1 + a2 * s2,
         a1 * k1 * cos(k1 * p.x + u.sun0.z), a2 * k2 * cos(k2 * p.y + u.sun0.w));
 }
 
@@ -131,7 +132,7 @@ fn waves(p: vec2f, t: f32, count: i32, dist: f32) -> vec3f {
         let amp = BASE_AMPLITUDE * pow(0.62, fi) * lod;
         let th = k * dot(dir, p) - omega * t + fi * 1.7;
         let e = exp(sin(th) - 1.0);
-        h = h + amp * e;
+        h = h + amp * (e - 0.466);
         let d = amp * e * cos(th) * k;
         dx = dx + d * dir.x;
         dz = dz + d * dir.y;
@@ -250,8 +251,7 @@ fn reflect_ray(p: vec3f, r: vec3f, fallback: vec3f) -> vec3f {
     return fallback;
 }
 
-@fragment
-fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> @location(0) vec4f {
+fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let info = surface_info(world.xz);
     // Nearest-cell mask: only open water is replaced; stagnant cells keep the stock water.
     var here: vec4f;
@@ -362,7 +362,7 @@ fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> @locati
     let shore = (1.0 - smoothstep(3.0, 34.0, thick)) * smoothstep(0.0, 8.0, thick + 3.0);
     let band = 0.5 + 0.5 * sin(thick * 0.14 - t * 1.3 + fn1 * 6.0);
     var foam = shore * smoothstep(0.40, 0.85, fn1 * 0.6 + band * 0.55) * 0.6;
-    let crest = smoothstep(0.62, 0.95, (w.x - sun_swell(world.xz).x) / (BASE_AMPLITUDE * 0.9)) * clamp(a_scale, 0.0, 1.0);
+    let crest = smoothstep(0.55, 0.95, (w.x - sun_swell(world.xz).x) / (BASE_AMPLITUDE * 0.9) + 0.55) * clamp(a_scale, 0.0, 1.0);
     foam = foam + crest * smoothstep(0.45, 0.75, fn2) * 0.8;
     foam = clamp(foam, 0.0, 1.0);
     col = mix(col, vec3f(0.92, 0.96, 0.98) * (0.35 + 0.65 * lum), foam);
@@ -401,6 +401,38 @@ fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> @locati
 const SUN_CELL: f32 = 200.0;
 const SUN_HALF: f32 = 2600.0;
 const SUN_COLS: u32 = 25u;
+
+struct FOut {
+    @location(0) color: vec4f,
+    @builtin(frag_depth) depth: f32,
+}
+
+// The stock water layers are flat and are hidden by depth, so wave troughs that dip below the
+// stock plane must still write the depth of that plane (plus a little cover): otherwise the flat
+// stock water shows through the troughs.
+@fragment
+fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> FOut {
+    var o: FOut;
+    o.color = shade_water(frag, world);
+    o.depth = frag.z;
+    let plane_y = surface_info(world.xz).x + COVER_LIFT;
+    if world.y < plane_y {
+        let dir = normalize(world - u.eye.xyz);
+        if abs(dir.y) > 1e-4 {
+            let t = (plane_y - u.eye.y) / dir.y;
+            if t > 0.0 {
+                let c = u.proj_from_world * vec4f(u.eye.xyz + dir * t, 1.0);
+                let d = c.z / c.w;
+                if u.warp.w > 0.5 {
+                    o.depth = max(frag.z, d);
+                } else {
+                    o.depth = min(frag.z, d);
+                }
+            }
+        }
+    }
+    return o;
+}
 
 struct SunOut {
     @builtin(position) pos: vec4f,
@@ -442,7 +474,7 @@ fn vs_sun(@builtin(vertex_index) vi: u32) -> SunOut {
     if u.sun2.y > 0.5 {
         // "Rolling waves" style: follow the opaque surface so the foam is not depth-culled by it.
         let ws = waves(vec2f(x, z), u.params.x, 2, length(vec2f(xo, zo)));
-        world.y = info.x + SURFACE_LIFT + ws.x * amplitude_scale(info.z, info.y) + 14.0;
+        world.y = max(info.x + SURFACE_LIFT + ws.x * amplitude_scale(info.z, info.y), info.x + COVER_LIFT) + 10.0;
     }
     o.pos = u.proj_from_world * vec4f(world, 1.0);
 
