@@ -145,6 +145,25 @@ fn amplitude_scale(open: f32, depth: f32) -> f32 {
     return u.params.y * open * smoothstep(40.0, 320.0, depth);
 }
 
+const MIN_DEPTH: f32 = 24.0;        // water shallower than this is left to the stock water
+
+fn usable(info: vec4f) -> bool {
+    return info.w >= 1e-4 && info.z >= 0.01 && info.y >= MIN_DEPTH;
+}
+
+fn grid_xz(gx: u32, gz: u32) -> vec2f {
+    let half = f32(u32(u.grid.w)) * 0.5;
+    let gu = f32(gx) - half;
+    let gv = f32(gz) - half;
+    // Dense near the camera, stretching toward the horizon.
+    return vec2f(
+        u.eye.x + sign(gu) * (u.warp.x * abs(gu) + u.warp.y * gu * gu),
+        u.eye.z + sign(gv) * (u.warp.x * abs(gv) + u.warp.y * gv * gv));
+}
+
+// Culling is decided per quad, never per vertex: a single vertex thrown outside the clip volume
+// drags its triangles into huge clipped slivers (the grey plane). Corners without water borrow the
+// height of the quad's water corners; the fragment shader's mask removes the dry part.
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
     var o: VOut;
@@ -153,25 +172,35 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
     let corner = vi % 6u;
     var cx = array<u32, 6>(0u, 1u, 0u, 1u, 1u, 0u);
     var cz = array<u32, 6>(0u, 0u, 1u, 0u, 1u, 1u);
-    let gx = quad % n + cx[corner];
-    let gz = quad / n + cz[corner];
-    let half = f32(n) * 0.5;
-    let gu = f32(gx) - half;
-    let gv = f32(gz) - half;
-    // Dense near the camera, stretching toward the horizon.
-    let x = u.eye.x + sign(gu) * (u.warp.x * abs(gu) + u.warp.y * gu * gu);
-    let z = u.eye.z + sign(gv) * (u.warp.x * abs(gv) + u.warp.y * gv * gv);
+    let qx = quad % n;
+    let qz = quad / n;
+    let own = grid_xz(qx + cx[corner], qz + cz[corner]);
 
-    let info = surface_info(vec2f(x, z));
-    if info.w < 1e-4 || info.z < 0.01 {
-        o.pos = vec4f(2.0, 2.0, 2.0, 1.0); // outside clip volume: culled
+    var hsum = 0.0;
+    var count = 0.0;
+    for (var k = 0u; k < 4u; k = k + 1u) {
+        let p = grid_xz(qx + (k & 1u), qz + (k >> 1u));
+        let ci = surface_info(p);
+        if usable(ci) {
+            hsum = hsum + ci.x;
+            count = count + 1.0;
+        }
+    }
+    if count < 0.5 {
+        o.pos = vec4f(2.0, 2.0, 2.0, 1.0); // whole quad dry: all six vertices collapse together
         o.world = vec3f(0.0);
         return o;
     }
-    let vdist = length(vec2f(x - u.eye.x, z - u.eye.z));
-    let w = waves(vec2f(x, z), u.params.x, WAVE_COUNT_VERTEX, vdist);
-    let y = info.x + SURFACE_LIFT + w.x * amplitude_scale(info.z, info.y);
-    let world = vec3f(x, y, z);
+    let info = surface_info(own);
+    var base = hsum / count;
+    var scale = 0.0;
+    if usable(info) {
+        base = info.x;
+        scale = amplitude_scale(info.z, info.y);
+    }
+    let vdist = length(own - u.eye.xz);
+    let w = waves(own, u.params.x, WAVE_COUNT_VERTEX, vdist);
+    let world = vec3f(own.x, base + SURFACE_LIFT + w.x * scale, own.y);
     o.world = world;
     o.pos = u.proj_from_world * vec4f(world, 1.0);
     return o;
@@ -263,7 +292,7 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
         let cell = vec2i(floor(world.xz / u.lat2.w) - u.lat2.xy);
         here = cell_at(1, cell.x, cell.y);
     }
-    if here.z < 1.5 {
+    if here.z < 1.5 || info.y < MIN_DEPTH {
         discard;
     }
 
@@ -360,11 +389,15 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     // Foam: shoreline (thin water) and wave crests.
     let fn1 = fbm(world.xz * 0.045 + vec2f(t * 0.05, t * 0.03));
     let fn2 = fbm(world.xz * 0.11 - vec2f(t * 0.04, -t * 0.06));
-    let shore = (1.0 - smoothstep(3.0, 34.0, thick)) * smoothstep(0.0, 8.0, thick + 3.0);
+    let shore = (1.0 - smoothstep(4.0, 55.0, thick)) * smoothstep(0.0, 6.0, thick + 3.0);
     let band = 0.5 + 0.5 * sin(thick * 0.14 - t * 1.3 + fn1 * 6.0);
-    var foam = shore * smoothstep(0.40, 0.85, fn1 * 0.6 + band * 0.55) * 0.6;
-    let crest = smoothstep(0.55, 0.95, (w.x - sun_swell(world.xz).x) / (BASE_AMPLITUDE * 0.9) + 0.55) * clamp(a_scale, 0.0, 1.0);
-    foam = foam + crest * smoothstep(0.45, 0.75, fn2) * 0.8;
+    var foam = shore * smoothstep(0.30, 0.70, fn1 * 0.6 + band * 0.55);
+    // Shoreline foam only: it follows the Foam Intensity setting and is never drawn when looking
+    // up at the water from underneath.
+    foam = foam * clamp(u.sun2.w, 0.0, 2.0);
+    if u.eye.y < world.y {
+        foam = 0.0;
+    }
     foam = clamp(foam, 0.0, 1.0);
     col = mix(col, vec3f(0.92, 0.96, 0.98) * (0.35 + 0.65 * lum), foam);
 
@@ -446,6 +479,10 @@ struct SunOut {
     @location(4) crest: f32,
 }
 
+fn sun_xz(gx: u32, gz: u32) -> vec2f {
+    return vec2f(-SUN_HALF + f32(gx) * SUN_CELL, -SUN_HALF + f32(gz) * SUN_CELL);
+}
+
 @vertex
 fn vs_sun(@builtin(vertex_index) vi: u32) -> SunOut {
     var o: SunOut;
@@ -453,16 +490,27 @@ fn vs_sun(@builtin(vertex_index) vi: u32) -> SunOut {
     let corner = vi % 6u;
     var cx = array<u32, 6>(0u, 1u, 0u, 1u, 1u, 0u);
     var cz = array<u32, 6>(0u, 0u, 1u, 0u, 1u, 1u);
-    let gx = quad % SUN_COLS + cx[corner];
-    let gz = quad / SUN_COLS + cz[corner];
-    let xo = -SUN_HALF + f32(gx) * SUN_CELL;
-    let zo = -SUN_HALF + f32(gz) * SUN_CELL;
+    let qx = quad % SUN_COLS;
+    let qz = quad / SUN_COLS;
+    let off = sun_xz(qx + cx[corner], qz + cz[corner]);
+    let xo = off.x;
+    let zo = off.y;
     let x = u.sun0.x + xo;
     let z = u.sun0.y + zo;
 
-    let info = surface_info(vec2f(x, z));
-    if info.w < 1e-4 || info.z < 0.01 {
-        o.pos = vec4f(2.0, 2.0, 2.0, 1.0); // not open water: culled
+    // Per-quad culling (see vs_main).
+    var hsum = 0.0;
+    var count = 0.0;
+    for (var k = 0u; k < 4u; k = k + 1u) {
+        let po = sun_xz(qx + (k & 1u), qz + (k >> 1u));
+        let ci = surface_info(u.sun0.xy + po);
+        if usable(ci) {
+            hsum = hsum + ci.x;
+            count = count + 1.0;
+        }
+    }
+    if count < 0.5 {
+        o.pos = vec4f(2.0, 2.0, 2.0, 1.0);
         o.uv0 = vec2f(0.0);
         o.uv1 = vec2f(0.0);
         o.va = 0.0;
@@ -470,26 +518,27 @@ fn vs_sun(@builtin(vertex_index) vi: u32) -> SunOut {
         o.crest = 0.0;
         return o;
     }
+    let info = surface_info(vec2f(x, z));
+    var base = hsum / count;
+    var depth = 0.0;
+    var open = 0.0;
+    if usable(info) {
+        base = info.x;
+        depth = info.y;
+        open = 1.0;
+    }
     // TMapObjWave::updateHeightAndAlpha: swell and alpha shrink toward the shore.
-    let depth = info.y;
     let amp = clamp(depth / 400.0, 0.0, 1.0);
     let a1 = u.sun1.x * amp;
     let a2 = u.sun1.y * amp;
     let h = a1 * sin(0.02 * (x * (1.0 / 6.28318)) + u.sun0.z)
           + a2 * sin(0.03 * (z * (1.0 / 6.28318)) + u.sun0.w);
-    var world = vec3f(x, info.x + h * u.params.y, z);
-    if u.sun2.y > 0.5 {
-        // "Rolling waves" style: follow the opaque surface so the foam is not depth-culled by it.
-        let ws = waves(vec2f(x, z), u.params.x, 2, length(vec2f(xo, zo)));
-        world.y = max(info.x + SURFACE_LIFT + ws.x * amplitude_scale(info.z, info.y),
-                      info.x + COVER_LIFT + length(vec2f(xo, zo)) * COVER_SLOPE) + 12.0;
-    }
+    let world = vec3f(x, base + h * u.params.y, z);
     o.pos = u.proj_from_world * vec4f(world, 1.0);
 
     // TMapObjWave::getAlpha, then the shore ramp (unk54).
     let fade = floor(255.0 * (1.0 - (1.0 / SUN_HALF) * max(abs(xo), abs(zo)))) / 255.0;
-    o.va = clamp(fade, 0.0, 1.0) * clamp(depth / 150.0, 0.0, 1.0);
-
+    o.va = clamp(fade, 0.0, 1.0) * clamp(depth / 150.0, 0.0, 1.0) * open;
     o.wp = vec2f(x, z);
     // Foam collects on the swell crests rather than covering the whole sea evenly.
     o.crest = smoothstep(-0.25, 0.75, h / max(u.sun1.x + u.sun1.y, 1.0));

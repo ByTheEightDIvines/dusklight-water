@@ -997,7 +997,9 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
         return;
     }
     g_frameValid = false;
-    if (g_sunDrawType == 0) {
+    // Rolling waves replaces the water entirely and draws its own shoreline foam; the speckle
+    // overlay is only for the Subtle style.
+    if (get_int_option(g_cvarMode, 1) == 1 || g_sunDrawType == 0) {
         return;
     }
 
@@ -1132,7 +1134,7 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     control.option_count = 3;
     svc_ui->pane_add_control(mod_ctx, panel, &control, nullptr);
 
-    add_number(panel, "Foam Intensity", "Brightness of the Sunshine wave foam.", g_cvarOverlay, 0,
+    add_number(panel, "Foam Intensity", "Shoreline foam (Rolling waves) or sparkle brightness (Subtle overlay).", g_cvarOverlay, 0,
         400, 10, "%");
     add_number(panel, "Refraction", "Sunshine-style wobble of the view through the water.",
         g_cvarRefract, 0, 400, 10, "%");
