@@ -452,6 +452,35 @@ fn fs_sun(in: SunOut) -> @location(0) vec4f {
         discard;
     }
     // RASC * 2 clamps to white; the tint lets the colour be adjusted later.
-    let colour = clamp(vec3f(200.0, 200.0, 255.0) / 255.0 * 2.0, vec3f(0.0), vec3f(1.0)) * u.sun2.xyz;
+    let colour = clamp(vec3f(200.0, 200.0, 255.0) / 255.0 * 2.0, vec3f(0.0), vec3f(1.0)) * vec3f(1.0);
     return vec4f(colour, a * u.sun2.w);
+}
+
+
+// Sunshine's indirect "seaindirect" layer: the scene behind the water is re-sampled through a
+// scrolling wobble texture. Drawn over the water surface before the foam overlay.
+@fragment
+fn fs_sea(in: SunOut) -> @location(0) vec4f {
+    let d = textureLoad(scene_depth, vec2i(in.pos.xy), 0).r;
+    if u.warp.w > 0.5 {
+        if in.pos.z < d - 1e-6 {
+            discard;
+        }
+    } else {
+        if in.pos.z > d + 1e-6 {
+            discard;
+        }
+    }
+    if u.screen.z > 0.5 {
+        return vec4f(0.1, 0.4, 0.9, 0.5);
+    }
+    let n0 = textureSample(wave_tex, wave_samp, in.uv0 * 4.0 + vec2f(0.0, u.sun1.w * 4.0)).r;
+    let n1 = textureSample(wave_tex, wave_samp, in.uv1 * 4.0 + vec2f(u.sun1.z * 4.0, 0.0)).r;
+    // Centre the offsets; the texture's mean intensity is low.
+    let off = (vec2f(n0, n1) - vec2f(0.15)) * 2.0 * u.sun2.x;
+    let size = u.screen.xy;
+    let px = in.pos.xy + off * 14.0 * (size.y / 720.0);
+    let uv = clamp(px / size, vec2f(0.001), vec2f(0.999));
+    let c = textureSampleLevel(scene_color, samp, uv, 0.0).rgb;
+    return vec4f(c, clamp(in.va * 4.0, 0.0, 1.0));
 }

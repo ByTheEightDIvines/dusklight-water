@@ -73,6 +73,7 @@ ConfigVarHandle g_cvarFog = 0;
 ConfigVarHandle g_cvarDebug = 0;
 ConfigVarHandle g_cvarMode = 0;
 ConfigVarHandle g_cvarOverlay = 0;
+ConfigVarHandle g_cvarRefract = 0;
 
 GfxDrawTypeHandle g_drawType = 0;
 GfxStageHookHandle g_stageHook = 0;
@@ -88,8 +89,8 @@ WGPUSampler g_repeatSampler = nullptr;
 WGPUTexture g_waveTex = nullptr;
 WGPUTextureView g_waveView = nullptr;
 ResourceBuffer g_waveRaw = RESOURCE_BUFFER_INIT;
-WGPURenderPipeline g_sunPipeline = nullptr;
-WGPUBindGroupLayout g_sunLayout = nullptr;
+WGPURenderPipeline g_sunPipelines[2] = {nullptr, nullptr};
+WGPUBindGroupLayout g_sunLayouts[2] = {nullptr, nullptr};
 GfxRenderTargetLayout g_sunPipelineLayout = GFX_RENDER_TARGET_LAYOUT_INIT;
 
 // Per-frame state handed from the after-opaque hook to the before-HUD hook (game thread).
@@ -452,12 +453,13 @@ void on_draw(
 
 struct SunPayload {
     WGPUTextureView depth;
+    WGPUTextureView color;
     uint32_t uniform_offset;
     uint32_t uniform_size;
     uint32_t storage_offset;
     uint32_t storage_size;
     uint32_t vertex_count;
-    uint32_t _pad;
+    uint32_t mode; // 0 = refraction layer, 1 = foam overlay
 };
 static_assert(sizeof(SunPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<SunPayload>);
@@ -466,18 +468,20 @@ constexpr uint32_t kSunCols = 25;
 constexpr uint32_t kSunRows = 26;
 
 void release_sun_pipeline() {
-    if (g_sunPipeline != nullptr) {
-        wgpuRenderPipelineRelease(g_sunPipeline);
-        g_sunPipeline = nullptr;
-    }
-    if (g_sunLayout != nullptr) {
-        wgpuBindGroupLayoutRelease(g_sunLayout);
-        g_sunLayout = nullptr;
+    for (int i = 0; i < 2; ++i) {
+        if (g_sunPipelines[i] != nullptr) {
+            wgpuRenderPipelineRelease(g_sunPipelines[i]);
+            g_sunPipelines[i] = nullptr;
+        }
+        if (g_sunLayouts[i] != nullptr) {
+            wgpuBindGroupLayoutRelease(g_sunLayouts[i]);
+            g_sunLayouts[i] = nullptr;
+        }
     }
     g_sunPipelineLayout = GFX_RENDER_TARGET_LAYOUT_INIT;
 }
 
-bool build_sun_pipeline(const GfxRenderTargetLayout& layout) {
+bool build_sun_pipeline(const GfxRenderTargetLayout& layout, uint32_t mode) {
     WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
     wgsl.code = {static_cast<const char*>(g_shaderSource.data), g_shaderSource.size};
     WGPUShaderModuleDescriptor moduleDesc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
@@ -492,7 +496,7 @@ bool build_sun_pipeline(const GfxRenderTargetLayout& layout) {
     WGPUBlendState blend{
         .color = {.operation = WGPUBlendOperation_Add,
             .srcFactor = WGPUBlendFactor_SrcAlpha,
-            .dstFactor = WGPUBlendFactor_One},
+            .dstFactor = mode == 0 ? WGPUBlendFactor_OneMinusSrcAlpha : WGPUBlendFactor_One},
         .alpha = {.operation = WGPUBlendOperation_Add,
             .srcFactor = WGPUBlendFactor_Zero,
             .dstFactor = WGPUBlendFactor_One},
@@ -503,7 +507,7 @@ bool build_sun_pipeline(const GfxRenderTargetLayout& layout) {
 
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
-    fragment.entryPoint = {"fs_sun", WGPU_STRLEN};
+    fragment.entryPoint = {mode == 0 ? "fs_sea" : "fs_sun", WGPU_STRLEN};
     fragment.targetCount = colorTargetCount;
     fragment.targets = colorTargets;
 
@@ -523,30 +527,28 @@ bool build_sun_pipeline(const GfxRenderTargetLayout& layout) {
     desc.depthStencil = &depthStencil;
     desc.multisample.count = layout.sample_count;
     desc.fragment = &fragment;
-    g_sunPipeline = wgpuDeviceCreateRenderPipeline(g_deviceInfo.device, &desc);
+    g_sunPipelines[mode] = wgpuDeviceCreateRenderPipeline(g_deviceInfo.device, &desc);
     wgpuShaderModuleRelease(module);
-    if (g_sunPipeline == nullptr) {
+    if (g_sunPipelines[mode] == nullptr) {
         return false;
     }
-    g_sunLayout = wgpuRenderPipelineGetBindGroupLayout(g_sunPipeline, 0);
-    if (g_sunLayout == nullptr) {
-        release_sun_pipeline();
-        return false;
-    }
-    g_sunPipelineLayout = layout;
-    return true;
+    g_sunLayouts[mode] = wgpuRenderPipelineGetBindGroupLayout(g_sunPipelines[mode], 0);
+    return g_sunLayouts[mode] != nullptr;
 }
 
 bool ensure_sun_pipeline(const GfxRenderTargetLayout& layout) {
-    if (g_sunPipeline != nullptr && g_sunPipelineLayout.key == layout.key) {
+    if (g_sunPipelines[0] != nullptr && g_sunPipelines[1] != nullptr &&
+        g_sunPipelineLayout.key == layout.key)
+    {
         return true;
     }
     release_sun_pipeline();
-    if (!build_sun_pipeline(layout)) {
+    if (!build_sun_pipeline(layout, 0) || !build_sun_pipeline(layout, 1)) {
         release_sun_pipeline();
         svc_log->error(mod_ctx, "failed to build Sunshine wave pipeline (shader error?)");
         return false;
     }
+    g_sunPipelineLayout = layout;
     return true;
 }
 
@@ -558,12 +560,15 @@ void on_sun_draw(
     }
     SunPayload data;
     std::memcpy(&data, payload, sizeof(data));
-    if (data.depth == nullptr || g_waveView == nullptr || g_repeatSampler == nullptr) {
+    if (data.depth == nullptr || g_waveView == nullptr || g_repeatSampler == nullptr ||
+        data.mode > 1 || (data.mode == 0 && data.color == nullptr))
+    {
         return;
     }
 
-    WGPUBindGroupEntry entries[5] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
-        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    WGPUBindGroupEntry entries[6] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT};
     entries[0].binding = 0;
     entries[0].buffer = ctx->uniform_buffer;
     entries[0].offset = data.uniform_offset;
@@ -578,15 +583,21 @@ void on_sun_draw(
     entries[3].textureView = g_waveView;
     entries[4].binding = 6;
     entries[4].sampler = g_repeatSampler;
+    uint32_t entryCount = 5;
+    if (data.mode == 0) {
+        entries[5].binding = 2;
+        entries[5].textureView = data.color;
+        entryCount = 6;
+    }
     WGPUBindGroupDescriptor bindDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-    bindDesc.layout = g_sunLayout;
-    bindDesc.entryCount = 5;
+    bindDesc.layout = g_sunLayouts[data.mode];
+    bindDesc.entryCount = entryCount;
     bindDesc.entries = entries;
     WGPUBindGroup group = wgpuDeviceCreateBindGroup(ctx->device, &bindDesc);
     if (group == nullptr) {
         return;
     }
-    wgpuRenderPassEncoderSetPipeline(ctx->pass, g_sunPipeline);
+    wgpuRenderPassEncoderSetPipeline(ctx->pass, g_sunPipelines[data.mode]);
     wgpuRenderPassEncoderSetBindGroup(ctx->pass, 0, group, 0, nullptr);
     wgpuRenderPassEncoderDraw(ctx->pass, data.vertex_count, 1, 0, 0);
     wgpuBindGroupRelease(group);
@@ -737,7 +748,10 @@ void fill_uniforms(Uniforms& uni, const CameraInfo& camera, uint32_t width, uint
     const float overlay =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarOverlay, 100), 0, 400)) /
         100.0f;
-    set4(uni.sun2, 1.0f, 1.0f, 1.0f, overlay);
+    const float refract =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRefract, 100), 0, 400)) /
+        100.0f;
+    set4(uni.sun2, refract, 1.0f, 1.0f, overlay);
 }
 
 // Game thread, after opaque scene draws and before translucent overlays (including stock water).
@@ -837,15 +851,15 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
     }
 
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
-    resolveDesc.color = false;
+    resolveDesc.color = true;
     resolveDesc.depth = true;
     GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
     if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
-        resolved.depth == nullptr)
+        resolved.depth == nullptr || resolved.color == nullptr)
     {
         if (!g_warnedNoResolve) {
             g_warnedNoResolve = true;
-            svc_log->warn(mod_ctx, "scene depth unavailable; wave overlay waits");
+            svc_log->warn(mod_ctx, "scene snapshots unavailable; wave overlay waits");
         }
         return;
     }
@@ -863,11 +877,18 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
 
     SunPayload payload{};
     payload.depth = resolved.depth;
+    payload.color = resolved.color;
     payload.uniform_offset = uniformRange.offset;
     payload.uniform_size = uniformRange.size;
     payload.storage_offset = storageRange.offset;
     payload.storage_size = storageRange.size;
     payload.vertex_count = kSunCols * kSunRows * 6u;
+    // Refraction wobble first (Sunshine's seaindirect layer), foam on top.
+    payload.mode = 0;
+    if (get_int_option(g_cvarRefract, 100) > 0) {
+        svc_gfx->push_draw(mod_ctx, g_sunDrawType, &payload, sizeof(payload));
+    }
+    payload.mode = 1;
     if (svc_gfx->push_draw(mod_ctx, g_sunDrawType, &payload, sizeof(payload)) == MOD_OK &&
         !g_loggedFirstDraw)
     {
@@ -942,6 +963,8 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
 
     add_number(panel, "Foam Intensity", "Brightness of the Sunshine wave foam.", g_cvarOverlay, 0,
         400, 10, "%");
+    add_number(panel, "Refraction", "Sunshine-style wobble of the view through the water.",
+        g_cvarRefract, 0, 400, 10, "%");
     add_number(panel, "Wave Height", "Size of the swell on open, deep water.", g_cvarWaveHeight, 0,
         300, 10, "%");
     add_number(panel, "Ripple Strength", "How strongly the surface ripples shade and reflect.",
@@ -986,7 +1009,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         register_int_option("distanceHaze", 100, g_cvarFog, error) != MOD_OK ||
         register_int_option("debugView", 0, g_cvarDebug, error) != MOD_OK ||
         register_int_option("style", 0, g_cvarMode, error) != MOD_OK ||
-        register_int_option("foamIntensity", 100, g_cvarOverlay, error) != MOD_OK)
+        register_int_option("foamIntensity", 100, g_cvarOverlay, error) != MOD_OK ||
+        register_int_option("refraction", 100, g_cvarRefract, error) != MOD_OK)
     {
         return MOD_ERROR;
     }
@@ -1078,7 +1102,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         g_sampler = nullptr;
     }
     g_cvarEnabled = g_cvarWaveHeight = g_cvarNormals = g_cvarClarity = g_cvarFog = g_cvarDebug = 0;
-    g_cvarMode = g_cvarOverlay = 0;
+    g_cvarMode = g_cvarOverlay = g_cvarRefract = 0;
     g_drawType = g_sunDrawType = 0;
     g_stageHook = g_hudHook = 0;
     return MOD_OK;
