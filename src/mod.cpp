@@ -561,14 +561,14 @@ void on_sun_draw(
     SunPayload data;
     std::memcpy(&data, payload, sizeof(data));
     if (data.depth == nullptr || g_waveView == nullptr || g_repeatSampler == nullptr ||
-        data.mode > 1 || (data.mode == 0 && data.color == nullptr))
+        data.mode > 1 || (data.mode == 0 && (data.color == nullptr || g_sampler == nullptr)))
     {
         return;
     }
 
-    WGPUBindGroupEntry entries[6] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+    WGPUBindGroupEntry entries[7] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
         WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
-        WGPU_BIND_GROUP_ENTRY_INIT};
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     entries[0].binding = 0;
     entries[0].buffer = ctx->uniform_buffer;
     entries[0].offset = data.uniform_offset;
@@ -587,7 +587,9 @@ void on_sun_draw(
     if (data.mode == 0) {
         entries[5].binding = 2;
         entries[5].textureView = data.color;
-        entryCount = 6;
+        entries[6].binding = 4; // the refraction layer samples the scene colour snapshot
+        entries[6].sampler = g_sampler;
+        entryCount = 7;
     }
     WGPUBindGroupDescriptor bindDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bindDesc.layout = g_sunLayouts[data.mode];
