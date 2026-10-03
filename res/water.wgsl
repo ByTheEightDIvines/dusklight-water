@@ -359,10 +359,13 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let strength = u.params.z * mix(0.35, 1.0, shallow) * max(u.params.y, 0.15);
     // Small ripples are always present, even if the big swell is turned down, but fade out
     // with distance so far water does not shimmer.
+    // One slowly drifting density field drives both the glints and the ripple detail, so the
+    // surface is busier (more glints, finer ripples) in the same patches.
+    let dens = smoothstep(0.30, 0.78, vnoise(world.xz * 0.0016 + vec2f(t * 0.012, -t * 0.008)));
     let ripple_fade = 1.0 - smoothstep(300.0, 2500.0, dist);
-    let ripple = (vnoise(world.xz * 0.05 + vec2f(t * 0.4, -t * 0.3)) - 0.5) * ripple_fade;
-    let ripple2 = (vnoise(world.xz * 0.11 - vec2f(t * 0.5, t * 0.2)) - 0.5) * ripple_fade;
-    let hi_fade = 1.0 - smoothstep(250.0, 1400.0, dist);
+    let ripple = (vnoise(world.xz * 0.05 + vec2f(t * 0.4, -t * 0.3)) - 0.5) * ripple_fade * (0.75 + 0.6 * dens);
+    let ripple2 = (vnoise(world.xz * 0.11 - vec2f(t * 0.5, t * 0.2)) - 0.5) * ripple_fade * (0.75 + 0.6 * dens);
+    let hi_fade = (1.0 - smoothstep(250.0, 1400.0, dist)) * (0.45 + 1.25 * dens);
     let ripple3 = (vnoise(world.xz * 0.23 + vec2f(-t * 0.7, t * 0.5)) - 0.5) * hi_fade;
     let ripple4 = (vnoise(world.xz * 0.47 + vec2f(t * 0.6, t * 0.8)) - 0.5) * hi_fade;
     // N: full detail (glint, refraction). N_low: smooth normal for reflections and Fresnel.
@@ -472,6 +475,21 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     foam = clamp(foam, 0.0, 1.0);
     col = mix(col, vec3f(0.92, 0.96, 0.98) * (0.35 + 0.65 * lum), foam);
 
+    // Wave texture: thin pale contour lines that trace the swell and stretch along the crests, as
+    // in Sunshine's sea. They are contours of the actual wave height, wandered by a slow noise so
+    // they break up and drift; the same density field as the glints makes them busier in patches.
+    if u.eye.y >= world.y && !stagnant {
+        let wander = vnoise(world.xz * 0.004 + vec2f(t * 0.02, 0.0)) * 2.0;
+        let ph1 = w.x * 0.24 + wander;
+        let ph2 = w.x * 0.47 - wander * 0.7 + 3.1;
+        let l1 = smoothstep(0.90, 0.995, 0.5 + 0.5 * cos(ph1 * 6.2832));
+        let l2 = smoothstep(0.93, 0.995, 0.5 + 0.5 * cos(ph2 * 6.2832));
+        let breakup2 = smoothstep(0.25, 0.60, vnoise(world.xz * 0.012 + vec2f(-t * 0.05, t * 0.03)));
+        let lines = (l1 * 0.8 + l2 * (0.2 + 0.8 * dens)) * breakup2;
+        let line_fade = (1.0 - smoothstep(2500.0, 7000.0, dist)) * smoothstep(20.0, 120.0, info.y);
+        col = mix(col, vec3f(0.86, 0.80, 0.64) * (0.35 + 0.65 * lum), clamp(lines * line_fade * (0.30 + 0.30 * dens), 0.0, 0.7));
+    }
+
     // Distance fog toward the scene fog colour.
     let fog = 1.0 - exp(-dist * u.params.w);
     col = mix(col, u.horizon.rgb, clamp(fog, 0.0, 1.0));
@@ -480,7 +498,7 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     if u.eye.y >= world.y && !stagnant {
         let Rg = reflect(-V, N);
         let g = glints(world.xz, dist, t, Rg, u.glint.xyz);
-        col = col + u.glint_col.rgb * g * 7.0 * u.glint.w * clamp(u.sun2.w, 0.0, 2.0) *
+        col = col + u.glint_col.rgb * g * 7.0 * (0.3 + 1.6 * dens) * u.glint.w * clamp(u.sun2.w, 0.0, 2.0) *
               (1.0 - 0.5 * clamp(fog, 0.0, 1.0));
     }
 
