@@ -145,26 +145,6 @@ fn waves(p: vec2f, t: f32, count: i32, dist: f32) -> vec3f {
     return vec3f(h, dx, dz);
 }
 
-// Swim ripples: irregular rings spreading from Link. Returns (strength, wobbled radius).
-fn ripple_ring(p: vec2f, t: f32) -> vec2f {
-    if u.ripple.x < 0.001 {
-        return vec2f(0.0);
-    }
-    let pr = p - u.sun0.xy;
-    let r0 = max(length(pr), 1.0);
-    let ang = atan2(pr.y, pr.x);
-    // The radius wobbles with direction and time, so the rings are never perfect circles.
-    let r = r0 + (24.0 * sin(3.0 * ang + t * 0.6) + 14.0 * sin(5.0 * ang - t * 0.8 + 1.7)) *
-                 smoothstep(40.0, 260.0, r0);
-    let env = (1.0 - smoothstep(80.0, 560.0, r0)) * smoothstep(30.0, 100.0, r0) * u.ripple.x;
-    return vec2f(env, r);
-}
-
-fn ripple_h(p: vec2f, t: f32) -> f32 {
-    let rr = ripple_ring(p, t);
-    return rr.x * (3.5 * sin(rr.y * 0.042 - t * 4.2) + 1.6 * sin(rr.y * 0.083 - t * 6.6 + 1.0));
-}
-
 // The Sunshine speckle texture as light flecks. Three bands at growing world scale keep the
 // flecks a similar size on screen from close up to the horizon.
 fn speck_band(p: vec2f, sc: f32, t: f32, seed: f32) -> f32 {
@@ -200,7 +180,7 @@ fn amplitude_scale(open: f32, depth: f32) -> f32 {
     return u.params.y * open * smoothstep(40.0, 320.0, depth);
 }
 
-const MIN_DEPTH: f32 = 24.0;        // water shallower than this is left to the stock water
+const MIN_DEPTH: f32 = 8.0;        // water shallower than this is left to the stock water
 
 fn usable(info: vec4f) -> bool {
     return info.w >= 1e-4 && info.z >= 0.01 && info.y >= MIN_DEPTH;
@@ -255,7 +235,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
     }
     let vdist = length(own - u.eye.xz);
     let w = waves(own, u.params.x, WAVE_COUNT_VERTEX, vdist);
-    let world = vec3f(own.x, base + SURFACE_LIFT + w.x * scale + ripple_h(own, u.params.x) * select(0.0, 1.0, usable(info)), own.y);
+    let world = vec3f(own.x, base + SURFACE_LIFT + w.x * scale, own.y);
     o.world = world;
     o.pos = u.proj_from_world * vec4f(world, 1.0);
     return o;
@@ -379,16 +359,12 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let ripple_fade = 1.0 - smoothstep(300.0, 2500.0, dist);
     let ripple = (vnoise(world.xz * 0.05 + vec2f(t * 0.4, -t * 0.3)) - 0.5) * ripple_fade;
     let ripple2 = (vnoise(world.xz * 0.11 - vec2f(t * 0.5, t * 0.2)) - 0.5) * ripple_fade;
+    let hi_fade = 1.0 - smoothstep(250.0, 1400.0, dist);
+    let ripple3 = (vnoise(world.xz * 0.23 + vec2f(-t * 0.7, t * 0.5)) - 0.5) * hi_fade;
+    let ripple4 = (vnoise(world.xz * 0.47 + vec2f(t * 0.6, t * 0.8)) - 0.5) * hi_fade;
     // N: full detail (glint, refraction). N_low: smooth normal for reflections and Fresnel.
-    var N = normalize(vec3f(-w.y * strength - ripple * 0.05, 1.0, -w.z * strength - ripple2 * 0.05));
+    var N = normalize(vec3f(-w.y * strength - (ripple + ripple3 * 1.1) * 0.05, 1.0, -w.z * strength - (ripple2 + ripple4 * 1.1) * 0.05));
     var N_low = normalize(vec3f(-w_low.y * strength, 1.0, -w_low.z * strength));
-
-    // Swim ripples also tilt the normals (finite differences of the ripple height).
-    let ripple_c = ripple_h(world.xz, t);
-    let ripple_gx = (ripple_h(world.xz + vec2f(6.0, 0.0), t) - ripple_c) / 6.0;
-    let ripple_gz = (ripple_h(world.xz + vec2f(0.0, 6.0), t) - ripple_c) / 6.0;
-    N = normalize(vec3f(N.x - ripple_gx * 0.8, N.y, N.z - ripple_gz * 0.8));
-    N_low = normalize(vec3f(N_low.x - ripple_gx * 0.5, N_low.y, N_low.z - ripple_gz * 0.5));
 
     let uv = frag.xy / u.screen.xy;
     let size = vec2i(u.screen.xy);
@@ -454,9 +430,9 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     // Foam: shoreline (thin water) and wave crests.
     let fn1 = fbm(world.xz * 0.045 + vec2f(t * 0.05, t * 0.03));
     let fn2 = fbm(world.xz * 0.11 - vec2f(t * 0.04, -t * 0.06));
-    let shore = (1.0 - smoothstep(4.0, 55.0, thick)) * smoothstep(0.0, 6.0, thick + 3.0);
+    let shore = (1.0 - smoothstep(3.0, 26.0, thick)) * smoothstep(0.0, 4.0, thick + 2.0);
     let band = 0.5 + 0.5 * sin(thick * 0.14 - t * 1.3 + fn1 * 6.0);
-    var foam = shore * smoothstep(0.22, 0.85, fn1 * 0.6 + band * 0.55);
+    var foam = shore * smoothstep(0.45, 0.9, fn1 * 0.7 + band * 0.35 + fn2 * 0.25) * 0.8;
     // Shoreline foam only: it follows the Foam Intensity setting and is never drawn when looking
     // up at the water from underneath.
     foam = foam * clamp(u.sun2.w, 0.0, 2.0);
@@ -474,10 +450,10 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     // path toward the sun or moon that stays visible all the way to the horizon.
     if u.eye.y >= world.y {
         let lum_s = clamp(luminance(u.amb.rgb) * 1.4, 0.12, 1.0);
-        let rr = ripple_ring(world.xz, t);
-        let band = smoothstep(0.30, 0.95, 0.5 + 0.5 * sin(rr.y * 0.042 - t * 4.2));
-        let ring_sparkle = rr.x * band * speck_near(world.xz, t) * 1.6;
-        col = col + vec3f(0.92, 0.97, 1.0) * (0.35 + 0.65 * lum_s) * ring_sparkle;
+        // Dense scrolling flecks near the camera (two layers drifting differently).
+        let near_w = 1.0 - smoothstep(1500.0, 4200.0, dist);
+        let fl = max(speck_band(world.xz, 0.0012, t, 0.0), speck_band(world.xz + vec2f(311.0, 127.0), 0.0019, t, 2.3));
+        col = col + vec3f(0.92, 0.97, 1.0) * (0.30 + 0.70 * lum_s) * fl * 0.6 * near_w * clamp(u.sun2.w, 0.0, 2.0);
 
         let Rg = reflect(-V, N_low);
         let along = max(dot(Rg, u.glint.xyz), 0.0);
