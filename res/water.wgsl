@@ -160,9 +160,13 @@ fn waves(p: vec2f, t: f32, count: i32, dist: f32) -> vec3f {
 // time, catch the light for an instant when their reflection lines up with the light. Three bands
 // at growing world scale keep the glints a similar size on screen from near to the horizon.
 fn glint_band(p: vec2f, g: f32, t: f32, R: vec3f, L: vec3f, seed: f32) -> f32 {
-    let q = p / g;
+    // Rotated grid, jittered centres and varied sizes: no visible lattice of dots.
+    let cs = cos(0.5 + seed * 0.9);
+    let sn = sin(0.5 + seed * 0.9);
+    let q = vec2f(p.x * cs - p.y * sn, p.x * sn + p.y * cs) / g;
     let id = floor(q) + vec2f(seed * 17.0, seed * 31.0);
-    let f = fract(q) - vec2f(0.5);
+    let jit = (vec2f(hash21(id + 1.3), hash21(id + 5.7)) - vec2f(0.5)) * 0.6;
+    let f = fract(q) - vec2f(0.5) - jit;
     let h = hash21(id);
     let a = hash21(id * 1.7 + 3.1) * 6.2832 + t * (0.7 + h * 1.6);
     // Small random facet tilt only: where the glints appear is decided by the swell's own slope.
@@ -170,7 +174,8 @@ fn glint_band(p: vec2f, g: f32, t: f32, R: vec3f, L: vec3f, seed: f32) -> f32 {
     let Rf = normalize(R + tilt);
     let along = max(dot(Rf, L), 0.0);
     let spec = pow(along, 150.0) * step(0.30, h);
-    let shape = smoothstep(0.5, 0.12, length(f));
+    let rad = 0.12 + 0.24 * hash21(id + 8.1);
+    let shape = smoothstep(rad, rad * 0.25, length(f));
     let tw = 0.55 + 0.45 * sin(t * (2.0 + h * 5.0) + h * 40.0);
     return spec * shape * tw;
 }
@@ -585,7 +590,8 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
         let breakup2 = smoothstep(0.25, 0.60, vnoise(world.xz * 0.006 + vec2f(-t * 0.05, t * 0.03)));
         let lines = (l1 * 0.8 + l2 * (0.15 + 0.7 * dens)) * breakup2;
         let line_fade = (1.0 - smoothstep(2500.0, 7000.0, dist)) * smoothstep(20.0, 120.0, info.y) * smoothstep(8.0, 45.0, thick);
-        col = mix(col, vec3f(0.86, 0.80, 0.64) * (0.35 + 0.65 * lum), clamp(lines * line_fade * (0.30 + 0.30 * dens), 0.0, 0.7));
+        // Pale highlights added to the water, not a darker tint: they read as light on the surface.
+        col = col + vec3f(0.55, 0.60, 0.55) * (0.25 + 0.75 * lum) * clamp(lines * line_fade * (0.20 + 0.22 * dens), 0.0, 0.5);
     }
 
     // Distance fog toward the scene fog colour.
