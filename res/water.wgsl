@@ -26,6 +26,7 @@ struct U {
     ripple: vec4f,   // x swim ripple intensity (0 = Link is not in the water)
     glint: vec4f,    // xyz direction to the sun or moon (whichever is up), w visibility
     glint_col: vec4f, // rgb colour of that light
+    spray: array<vec4f, 8>, // waterfall spray emitters: xyz foot position, w strength (0 = unused)
 }
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -788,4 +789,82 @@ fn fs_sea(in: SunOut) -> @location(0) vec4f {
     let uv = clamp(px / size, vec2f(0.001), vec2f(0.999));
     let c = textureSampleLevel(scene_color, samp, uv, 0.0).rgb;
     return vec4f(c, clamp(in.va * 4.0, 0.0, 1.0));
+}
+
+
+// ===============================================================================================
+// Waterfall spray: camera-facing droplets thrown up from the foot of each fall. Each particle is
+// derived from its index alone (a repeating ballistic arc), so no particle buffer is needed.
+// ===============================================================================================
+const SPRAY_N: u32 = 48u;
+
+struct SprayOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+    @location(1) world: vec3f,
+    @location(2) alpha: f32,
+}
+
+@vertex
+fn vs_spray(@builtin(vertex_index) vi: u32) -> SprayOut {
+    var o: SprayOut;
+    o.uv = vec2f(0.0);
+    o.world = vec3f(0.0);
+    o.alpha = 0.0;
+    o.pos = vec4f(2.0, 2.0, 2.0, 1.0);
+    let quad = vi / 6u;
+    let corner = vi % 6u;
+    let e = quad / SPRAY_N;
+    let pi = quad % SPRAY_N;
+    if e >= 8u {
+        return o;
+    }
+    let em = u.spray[e];
+    if em.w < 0.01 {
+        return o;
+    }
+    let seed = f32(pi) * 1.37 + f32(e) * 57.3;
+    let period = 1.1 + hash21(vec2f(seed, 1.0)) * 1.1;
+    let ph = fract(u.params.x / period + hash21(vec2f(seed, 2.0)));
+    let tt = ph * period;
+    let ang = hash21(vec2f(seed, 3.0)) * 6.2832;
+    let big = hash21(vec2f(seed, 4.0)) < 0.25;     // a quarter of the particles are slow mist
+    let sp = select(30.0 + 90.0 * hash21(vec2f(seed, 5.0)), 15.0 + 35.0 * hash21(vec2f(seed, 5.0)), big);
+    let vy = select(220.0 + 280.0 * hash21(vec2f(seed, 6.0)), 60.0 + 120.0 * hash21(vec2f(seed, 6.0)), big) * (0.6 + 0.4 * em.w);
+    let jr = 50.0 * hash21(vec2f(seed, 7.0));
+    let origin = em.xyz + vec3f(cos(ang) * jr, 0.0, sin(ang) * jr);
+    let pos = origin + vec3f(cos(ang) * sp * tt, vy * tt - 0.5 * 700.0 * tt * tt, sin(ang) * sp * tt);
+    if pos.y < em.y {
+        return o;
+    }
+    let size = select(5.0 + 7.0 * hash21(vec2f(seed, 8.0)), 28.0 + 30.0 * hash21(vec2f(seed, 8.0)), big) * (0.7 + 0.6 * ph);
+    var cx = array<f32, 6>(-1.0, 1.0, -1.0, 1.0, 1.0, -1.0);
+    var cy = array<f32, 6>(-1.0, -1.0, 1.0, -1.0, 1.0, 1.0);
+    let to_eye = u.eye.xyz - pos;
+    let right = normalize(cross(vec3f(0.0, 1.0, 0.0), to_eye));
+    let cam_up = normalize(cross(to_eye, right));
+    let wp = pos + (right * cx[corner] + cam_up * cy[corner]) * size;
+    o.pos = u.proj_from_world * vec4f(wp, 1.0);
+    o.uv = vec2f(cx[corner], cy[corner]);
+    o.world = pos;
+    o.alpha = em.w * sin(ph * 3.14159) * select(0.75, 0.22, big) *
+              (1.0 - smoothstep(1800.0, 3000.0, length(to_eye)));
+    return o;
+}
+
+@fragment
+fn fs_spray(in: SprayOut) -> @location(0) vec4f {
+    let a = in.alpha * (1.0 - smoothstep(0.25, 1.0, length(in.uv)));
+    if a < 0.003 {
+        discard;
+    }
+    // Hidden behind scene geometry?
+    let uv = in.pos.xy / u.screen.xy;
+    let d0 = textureLoad(scene_depth, vec2i(in.pos.xy), 0).r;
+    let scene = unproject(uv, d0);
+    if length(scene - u.eye.xyz) < length(in.world - u.eye.xyz) - 6.0 {
+        discard;
+    }
+    let lum = clamp(luminance(u.amb.rgb) * 1.4, 0.12, 1.0);
+    return vec4f(vec3f(0.94, 0.97, 1.0) * (0.45 + 0.55 * lum), a);
 }

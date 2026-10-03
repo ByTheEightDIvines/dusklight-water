@@ -77,6 +77,7 @@ ConfigVarHandle g_cvarDebug = 0;
 ConfigVarHandle g_cvarMode = 0;
 ConfigVarHandle g_cvarOverlay = 0;
 ConfigVarHandle g_cvarRefract = 0;
+ConfigVarHandle g_cvarSpray = 0;
 ConfigVarHandle g_cvarColor = 0;
 
 GfxDrawTypeHandle g_drawType = 0;
@@ -93,8 +94,10 @@ WGPUSampler g_repeatSampler = nullptr;
 WGPUTexture g_waveTex = nullptr;
 WGPUTextureView g_waveView = nullptr;
 ResourceBuffer g_waveRaw = RESOURCE_BUFFER_INIT;
-WGPURenderPipeline g_sunPipelines[2] = {nullptr, nullptr};
-WGPUBindGroupLayout g_sunLayouts[2] = {nullptr, nullptr};
+WGPURenderPipeline g_sunPipelines[3] = {nullptr, nullptr, nullptr}; // 0 refraction, 1 foam, 2 spray
+WGPUBindGroupLayout g_sunLayouts[3] = {nullptr, nullptr, nullptr};
+float g_spray[8][4] = {};  // waterfall spray emitters: xyz foot position, w strength
+int g_sprayCount = 0;
 GfxRenderTargetLayout g_sunPipelineLayout = GFX_RENDER_TARGET_LAYOUT_INIT;
 
 // Per-frame state handed from the after-opaque hook to the before-HUD hook (game thread).
@@ -315,6 +318,66 @@ constexpr float kSwellScale = 0.72f;
 constexpr int kWaveCountVertex = 5;
 
 bool g_snapshotReady = false;
+
+// Waterfall spray emitters: places where a fine-tier water cell has a much higher water cell right
+// next to it (the pool at the foot of a fall and the ledge above it).
+void update_spray(const CameraInfo& camera) {
+    constexpr int W = kLatticeWidth;
+    struct Cand {
+        float x, y, z, strength, d2;
+    };
+    std::array<Cand, 64> cands;
+    int n = 0;
+    const std::array<float, 4>* tier = g_snapshot.data();
+    for (int j = 1; j < W - 1; ++j) {
+        for (int i = 1; i < W - 1; ++i) {
+            const std::array<float, 4>& c = tier[j * W + i];
+            if (c[2] < 0.5f) {
+                continue;
+            }
+            static const int kDx[4] = {1, -1, 0, 0};
+            static const int kDz[4] = {0, 0, 1, -1};
+            for (int k = 0; k < 4; ++k) {
+                const std::array<float, 4>& nb = tier[(j + kDz[k]) * W + (i + kDx[k])];
+                const float step = nb[0] - c[0];
+                if (nb[2] < 0.5f || step < 40.0f || step > 700.0f) {
+                    continue;
+                }
+                const float x = (static_cast<float>(g_fine.ix0 + i) + 0.5f + 0.5f * kDx[k]) * kFineCell;
+                const float z = (static_cast<float>(g_fine.iz0 + j) + 0.5f + 0.5f * kDz[k]) * kFineCell;
+                const float dx = x - camera.eye[0];
+                const float dz = z - camera.eye[2];
+                const float d2 = dx * dx + dz * dz;
+                if (d2 > 3000.0f * 3000.0f || n >= static_cast<int>(cands.size())) {
+                    continue;
+                }
+                cands[n++] = {x, c[0] + 2.0f, z, std::clamp(step / 200.0f, 0.35f, 1.0f), d2};
+            }
+        }
+    }
+    std::sort(cands.begin(), cands.begin() + n,
+        [](const Cand& a, const Cand& b) { return a.d2 < b.d2; });
+    g_sprayCount = 0;
+    for (int i = 0; i < n && g_sprayCount < 8; ++i) {
+        bool near = false;
+        for (int k = 0; k < g_sprayCount; ++k) {
+            const float dx = g_spray[k][0] - cands[i].x;
+            const float dz = g_spray[k][2] - cands[i].z;
+            if (dx * dx + dz * dz < 180.0f * 180.0f) {
+                near = true;
+                break;
+            }
+        }
+        if (near) {
+            continue;
+        }
+        g_spray[g_sprayCount][0] = cands[i].x;
+        g_spray[g_sprayCount][1] = cands[i].y;
+        g_spray[g_sprayCount][2] = cands[i].z;
+        g_spray[g_sprayCount][3] = cands[i].strength;
+        ++g_sprayCount;
+    }
+}
 float g_collisionEye[2] = {0.0f, 0.0f};
 
 float smoothstep_f(float a, float b, float x) {
@@ -444,6 +507,7 @@ struct Uniforms {
     float ripple[4];
     float glint[4];
     float glint_col[4];
+    float spray[8][4];
 };
 static_assert(sizeof(Uniforms) % 16 == 0);
 
@@ -607,11 +671,12 @@ struct SunPayload {
 static_assert(sizeof(SunPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<SunPayload>);
 
+constexpr uint32_t kSprayPerEmitter = 48; // must match SPRAY_N in water.wgsl
 constexpr uint32_t kSunCols = 25;
 constexpr uint32_t kSunRows = 26;
 
 void release_sun_pipeline() {
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
         if (g_sunPipelines[i] != nullptr) {
             wgpuRenderPipelineRelease(g_sunPipelines[i]);
             g_sunPipelines[i] = nullptr;
@@ -639,7 +704,7 @@ bool build_sun_pipeline(const GfxRenderTargetLayout& layout, uint32_t mode) {
     WGPUBlendState blend{
         .color = {.operation = WGPUBlendOperation_Add,
             .srcFactor = WGPUBlendFactor_SrcAlpha,
-            .dstFactor = mode == 0 ? WGPUBlendFactor_OneMinusSrcAlpha : WGPUBlendFactor_One},
+            .dstFactor = mode == 1 ? WGPUBlendFactor_One : WGPUBlendFactor_OneMinusSrcAlpha},
         .alpha = {.operation = WGPUBlendOperation_Add,
             .srcFactor = WGPUBlendFactor_Zero,
             .dstFactor = WGPUBlendFactor_One},
@@ -650,7 +715,7 @@ bool build_sun_pipeline(const GfxRenderTargetLayout& layout, uint32_t mode) {
 
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
-    fragment.entryPoint = {mode == 0 ? "fs_sea" : "fs_sun", WGPU_STRLEN};
+    fragment.entryPoint = {mode == 0 ? "fs_sea" : (mode == 1 ? "fs_sun" : "fs_spray"), WGPU_STRLEN};
     fragment.targetCount = colorTargetCount;
     fragment.targets = colorTargets;
 
@@ -664,7 +729,7 @@ bool build_sun_pipeline(const GfxRenderTargetLayout& layout, uint32_t mode) {
     WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
     desc.label = {"Better Water (Sunshine)", WGPU_STRLEN};
     desc.vertex.module = module;
-    desc.vertex.entryPoint = {"vs_sun", WGPU_STRLEN};
+    desc.vertex.entryPoint = {mode == 2 ? "vs_spray" : "vs_sun", WGPU_STRLEN};
     desc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
     desc.primitive.cullMode = WGPUCullMode_None;
     desc.depthStencil = &depthStencil;
@@ -703,6 +768,35 @@ void on_sun_draw(
     }
     SunPayload data;
     std::memcpy(&data, payload, sizeof(data));
+    if (data.mode == 2) {
+        // Waterfall spray: built on first use, independently of the other two layers.
+        if (data.depth == nullptr) {
+            return;
+        }
+        if (g_sunPipelines[2] == nullptr && !build_sun_pipeline(ctx->layout, 2)) {
+            return;
+        }
+        WGPUBindGroupEntry sprayEntries[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+        sprayEntries[0].binding = 0;
+        sprayEntries[0].buffer = ctx->uniform_buffer;
+        sprayEntries[0].offset = data.uniform_offset;
+        sprayEntries[0].size = data.uniform_size;
+        sprayEntries[1].binding = 3;
+        sprayEntries[1].textureView = data.depth;
+        WGPUBindGroupDescriptor sprayDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+        sprayDesc.layout = g_sunLayouts[2];
+        sprayDesc.entryCount = 2;
+        sprayDesc.entries = sprayEntries;
+        WGPUBindGroup sprayGroup = wgpuDeviceCreateBindGroup(ctx->device, &sprayDesc);
+        if (sprayGroup == nullptr) {
+            return;
+        }
+        wgpuRenderPassEncoderSetPipeline(ctx->pass, g_sunPipelines[2]);
+        wgpuRenderPassEncoderSetBindGroup(ctx->pass, 0, sprayGroup, 0, nullptr);
+        wgpuRenderPassEncoderDraw(ctx->pass, data.vertex_count, 1, 0, 0);
+        wgpuBindGroupRelease(sprayGroup);
+        return;
+    }
     if (data.depth == nullptr || g_waveView == nullptr || g_repeatSampler == nullptr ||
         data.mode > 1 || (data.mode == 0 && (data.color == nullptr || g_sampler == nullptr)))
     {
@@ -929,6 +1023,10 @@ void fill_uniforms(Uniforms& uni, const CameraInfo& camera, uint32_t width, uint
             set4(uni.glint_col, 0.0f, 0.0f, 0.0f, 1.0f);
         }
     }
+    for (int i = 0; i < 8; ++i) {
+        const bool on = i < g_sprayCount && get_bool_option(g_cvarSpray, true);
+        set4(uni.spray[i], g_spray[i][0], g_spray[i][1], g_spray[i][2], on ? g_spray[i][3] : 0.0f);
+    }
     set4(uni.sun2, refract, get_int_option(g_cvarMode, 1) == 1 ? 1.0f : 0.0f,
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarColor, 0), 0, 2)), overlay);
 }
@@ -987,6 +1085,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const bool fineOpen = update_lattice(g_fine, g_snapshot.data(), camera, playerY);
     const bool coarseOpen = update_lattice(
         g_coarse, g_snapshot.data() + kLatticeWidth * kLatticeWidth, camera, playerY);
+    update_spray(camera);
     // Nothing open nearby: skip the draw entirely.
     if (!fineOpen && !coarseOpen) {
         return;
@@ -1041,6 +1140,16 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     {
         g_loggedFirstDraw = true;
         svc_log->info(mod_ctx, "first water surface queued");
+    }
+    // Waterfall spray droplets, drawn over the water.
+    if (g_sprayCount > 0 && g_sunDrawType != 0 && get_bool_option(g_cvarSpray, true)) {
+        SunPayload spray{};
+        spray.depth = resolved.depth;
+        spray.uniform_offset = uniformRange.offset;
+        spray.uniform_size = uniformRange.size;
+        spray.vertex_count = 8u * kSprayPerEmitter * 6u;
+        spray.mode = 2;
+        svc_gfx->push_draw(mod_ctx, g_sunDrawType, &spray, sizeof(spray));
     }
 }
 
@@ -1164,6 +1273,15 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     control.config_var = g_cvarSwim;
     svc_ui->pane_add_control(mod_ctx, panel, &control, nullptr);
 
+    control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_TOGGLE;
+    control.label = "Waterfall spray";
+    control.help_rml = "Spray droplets, splash foam and ripples where water falls into a pool. "
+                       "Only applies in Rolling waves style.";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarSpray;
+    svc_ui->pane_add_control(mod_ctx, panel, &control, nullptr);
+
     static const char* kModeOptions[] = {"Subtle overlay", "Rolling waves"};
     control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_SELECT;
@@ -1231,6 +1349,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 
     if (register_bool_option("waterEnabled", true, g_cvarEnabled, error) != MOD_OK ||
         register_bool_option("wavesMoveSwimming", true, g_cvarSwim, error) != MOD_OK ||
+        register_bool_option("waterfallSpray", true, g_cvarSpray, error) != MOD_OK ||
         register_int_option("waveHeight", 100, g_cvarWaveHeight, error) != MOD_OK ||
         register_int_option("rippleStrength", 100, g_cvarNormals, error) != MOD_OK ||
         register_int_option("clarity", 100, g_cvarClarity, error) != MOD_OK ||
@@ -1334,7 +1453,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         wgpuSamplerRelease(g_sampler);
         g_sampler = nullptr;
     }
-    g_cvarSwim = g_cvarEnabled = g_cvarWaveHeight = g_cvarNormals = g_cvarClarity = g_cvarFog = g_cvarDebug = 0;
+    g_cvarSpray = g_cvarSwim = g_cvarEnabled = g_cvarWaveHeight = g_cvarNormals = g_cvarClarity = g_cvarFog = g_cvarDebug = 0;
     g_cvarMode = g_cvarOverlay = g_cvarRefract = g_cvarColor = 0;
     g_drawType = g_sunDrawType = 0;
     g_stageHook = g_hudHook = 0;
