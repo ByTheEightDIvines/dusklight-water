@@ -39,7 +39,8 @@ const BASE_AMPLITUDE: f32 = 12.0;   // world units (1 unit is about 1 cm), scale
 const BASE_WAVELENGTH: f32 = 900.0;
 const SWELL_SCALE: f32 = 0.6;       // fraction of Sunshine's swell amplitude used by the custom surface
 const SURFACE_LIFT: f32 = 0.0;
-const COVER_LIFT: f32 = 10.0;       // depth is written as if the surface were at least this far above the stock water plane      // keeps the surface just above the stock water plane
+const COVER_SLOPE: f32 = 0.012;     // extra cover per unit of camera distance
+const COVER_LIFT: f32 = 12.0;       // depth is written as if the surface were at least this far above the stock water plane      // keeps the surface just above the stock water plane
 
 struct VOut {
     @builtin(position) pos: vec4f,
@@ -415,7 +416,9 @@ fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> FOut {
     var o: FOut;
     o.color = shade_water(frag, world);
     o.depth = frag.z;
-    let plane_y = surface_info(world.xz).x + COVER_LIFT;
+    // The cover grows with distance: depth precision falls off, and a thin cover lets the stock
+    // water's sparkle texture z-fight through as a dotted grid on far water.
+    let plane_y = surface_info(world.xz).x + COVER_LIFT + length(world - u.eye.xyz) * COVER_SLOPE;
     if world.y < plane_y {
         let dir = normalize(world - u.eye.xyz);
         if abs(dir.y) > 1e-4 {
@@ -474,7 +477,8 @@ fn vs_sun(@builtin(vertex_index) vi: u32) -> SunOut {
     if u.sun2.y > 0.5 {
         // "Rolling waves" style: follow the opaque surface so the foam is not depth-culled by it.
         let ws = waves(vec2f(x, z), u.params.x, 2, length(vec2f(xo, zo)));
-        world.y = max(info.x + SURFACE_LIFT + ws.x * amplitude_scale(info.z, info.y), info.x + COVER_LIFT) + 10.0;
+        world.y = max(info.x + SURFACE_LIFT + ws.x * amplitude_scale(info.z, info.y),
+                      info.x + COVER_LIFT + length(vec2f(xo, zo)) * COVER_SLOPE) + 12.0;
     }
     o.pos = u.proj_from_world * vec4f(world, 1.0);
 
