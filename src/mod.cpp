@@ -621,7 +621,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return mods::set_error(error, result, "failed to load water shader");
     }
 
-    if (register_bool_option("enabled", true, g_cvarEnabled, error) != MOD_OK ||
+    if (register_bool_option("waterEnabled", true, g_cvarEnabled, error) != MOD_OK ||
         register_int_option("waveHeight", 100, g_cvarWaveHeight, error) != MOD_OK ||
         register_int_option("rippleStrength", 100, g_cvarNormals, error) != MOD_OK ||
         register_int_option("clarity", 100, g_cvarClarity, error) != MOD_OK ||
