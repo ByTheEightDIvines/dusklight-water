@@ -45,7 +45,7 @@ const BASE_WAVELENGTH: f32 = 900.0;
 const SWELL_SCALE: f32 = 0.72;      // fraction of Sunshine's swell amplitude used by the custom surface
 const SURFACE_LIFT: f32 = 0.0;
 const COVER_SLOPE: f32 = 0.012;     // extra cover per unit of camera distance
-const COVER_LIFT: f32 = 22.0;       // depth is written as if the surface were at least this far above the stock water plane      // keeps the surface just above the stock water plane
+const COVER_LIFT: f32 = 12.0;       // depth is written as if the surface were at least this far above the stock water plane      // keeps the surface just above the stock water plane
 
 struct VOut {
     @builtin(position) pos: vec4f,
@@ -197,14 +197,6 @@ fn glints(p: vec2f, dist: f32, t: f32, R: vec3f, L: vec3f) -> f32 {
     return s;
 }
 
-// 1 when the nearest lattice cell was grown into a shallow without water collision.
-fn cell_fill(xz: vec2f) -> f32 {
-    if use_fine(xz) {
-        return cell_at(0, i32(floor(xz.x / u.lat.w) - u.lat.x), i32(floor(xz.y / u.lat.w) - u.lat.y)).w;
-    }
-    return cell_at(1, i32(floor(xz.x / u.lat2.w) - u.lat2.x), i32(floor(xz.y / u.lat2.w) - u.lat2.y)).w;
-}
-
 // Nearest-cell lattice read: (height, is wet).
 fn cell_h(xz: vec2f) -> vec2f {
     var c: vec4f;
@@ -220,14 +212,13 @@ fn cell_h(xz: vec2f) -> vec2f {
 // in the lattice as a ledge of water much higher than the pool below it; the field is a smooth
 // weighted count of such ledge cells around the point, so its contours are rings about the foot.
 fn fall_field(xz: vec2f, y: f32) -> f32 {
-    let jit = hash21(floor(xz * 0.25)) * 1.047198; // dithers the cell-sized steps of the lattice
     var acc = 0.0;
     var tot = 0.0;
     for (var r = 0u; r < 3u; r = r + 1u) {
-        let rad = 55.0 + 50.0 * f32(r);
-        let wgt = 1.0 - 0.35 * f32(r);
+        let rad = 60.0 + 85.0 * f32(r);
+        let wgt = 1.0 - 0.28 * f32(r);
         for (var k = 0u; k < 6u; k = k + 1u) {
-            let ang = f32(k) * 1.047198 + jit;
+            let ang = f32(k) * 1.047198;
             let hc = cell_h(xz + vec2f(cos(ang), sin(ang)) * rad);
             if hc.y > 0.5 && hc.x > y + kStepLimit {
                 acc = acc + wgt;
@@ -242,7 +233,7 @@ fn amplitude_scale(open: f32, depth: f32) -> f32 {
     return u.params.y * open * smoothstep(40.0, 320.0, depth);
 }
 
-const MIN_DEPTH: f32 = -1.0;        // water shallower than this is left to the stock water
+const MIN_DEPTH: f32 = 2.0;        // water shallower than this is left to the stock water
 
 fn usable(info: vec4f) -> bool {
     return info.w >= 1e-4 && info.y >= MIN_DEPTH;
@@ -288,7 +279,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
         }
     }
     // A quad spanning a step (waterfall face, ledge) is dropped so no sheet slopes across it.
-    if count < 0.5 {
+    if count < 0.5 || hmax - hmin > kStepLimit {
         o.pos = vec4f(2.0, 2.0, 2.0, 1.0); // whole quad dry: all six vertices collapse together
         o.world = vec3f(0.0);
         return o;
@@ -296,16 +287,9 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
     let info = surface_info(own);
     var base = hsum / count;
     var scale = 0.0;
-    let stepped = hmax - hmin > kStepLimit;
     if usable(info) {
         base = info.x;
         scale = amplitude_scale(info.z, info.y);
-    }
-    // A quad spanning a step (waterfall face, ledge) is flattened to the lower pool; the fragment
-    // shader throws away the part that belongs to the higher ledge.
-    if stepped {
-        base = hmin;
-        scale = 0.0;
     }
     let vdist = length(own - u.eye.xz);
     let w = waves(own, u.params.x, WAVE_COUNT_VERTEX, vdist);
@@ -399,14 +383,11 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     // Smooth (bilinear) openness among the wet neighbours instead of the nearest cell, so the edge
     // of the replaced water follows smooth contours instead of a staircase of lattice cells.
     // Cells that are wet but not open are still water (ponds, puddles): they get a calm, murky look.
-    if info.x > world.y + 28.0 {
-        discard; // belongs to a higher ledge: the quad was flattened to the pool below
-    }
     let open_frac = info.z / max(info.w, 1e-4);
     let stagnant = open_frac < 0.5;
     // Only about half a lattice cell past the last wet cell is covered; the true shoreline is cut
     // by the terrain test below.
-    if info.w < 0.1 || info.y < MIN_DEPTH {
+    if info.w < 0.5 || info.y < MIN_DEPTH {
         discard;
     }
 
@@ -440,13 +421,13 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let ripple2 = (vnoise(world.xz * 0.11 - vec2f(t * 0.5, t * 0.2)) - 0.5) * ripple_fade * (0.75 + 0.6 * dens);
     var fall = 0.0;
     if u.eye.y >= world.y && !stagnant {
-        fall = smoothstep(0.08, 0.85, fall_field(world.xz, info.x) * 1.8);
+        fall = clamp(fall_field(world.xz, info.x) * 2.4, 0.0, 1.0);
     }
     let hi_fade = (1.0 - smoothstep(250.0, 1400.0, dist)) * (0.45 + 1.25 * dens);
     let ripple3 = (vnoise(world.xz * 0.23 + vec2f(-t * 0.7, t * 0.5)) - 0.5) * hi_fade;
     let ripple4 = (vnoise(world.xz * 0.47 + vec2f(t * 0.6, t * 0.8)) - 0.5) * hi_fade;
     // N: full detail (glint, refraction). N_low: smooth normal for reflections and Fresnel.
-    let calm = select(1.0, 0.6, stagnant);
+    let calm = select(1.0, 0.3, stagnant);
     var N = normalize(vec3f(-w.y * strength - (ripple + ripple3 * 1.1) * 0.05 * calm, 1.0, -w.z * strength - (ripple2 + ripple4 * 1.1) * 0.05 * calm));
     var N_low = normalize(vec3f(-w_low.y * strength, 1.0, -w_low.z * strength));
     let N_w = normalize(vec3f(-w.y * strength, 1.0, -w.z * strength)); // swell only, for glints
@@ -474,31 +455,16 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let scene0 = unproject(uv, d0);
     // Terrain above the surface (a beach, a rock face) is not water: without this the cover that
     // hides the stock plane draws the water as a glassy lip over the shore.
-    var terrain_above = false;
     if u.eye.y >= world.y && scene0.y > world.y + 1.0 + dist * 0.002 && length(scene0 - eye) < 60000.0 {
-        if scene0.y > world.y + 40.0 {
-            discard;
-        }
-        terrain_above = true;
-    }
-    if terrain_above {
-        // Shore band: show the scene as it is, but still claim the depth so the stock water's own
-        // rim cannot draw a dark line over it.
-        return vec4f(textureSampleLevel(scene_color, samp, uv, 0.0).rgb, 1.0);
-    }
-    var thick0 = max(world.y - scene0.y, 0.0);
-    // Grown cells (no water collision here) are only water over a genuinely shallow bed.
-    if cell_fill(world.xz) > 0.5 && thick0 > 100.0 {
         discard;
     }
+    var thick0 = max(world.y - scene0.y, 0.0);
     if length(scene0 - eye) > 60000.0 {
         thick0 = 2000.0;
     }
 
     // Refraction: offset by the normal, but never pull in something in front of the water.
-    // Mostly the smooth swell tilts what is seen below; fine ripples only add a hint, so the
-    // lakebed does not shimmer and warp.
-    var uv_r = uv + (N_low.xz * 0.022 + (N.xz - N_low.xz) * 0.006) * clamp(thick0 / 120.0, 0.0, 1.0) * u.screen.w +
+    var uv_r = uv + N.xz * 0.03 * clamp(thick0 / 120.0, 0.0, 1.0) * u.screen.w +
                sw * 0.14 * clamp(thick0 / 40.0, 0.25, 1.0) * u.screen.w;
     uv_r = clamp(uv_r, vec2f(0.002), vec2f(0.998));
     let d_r = textureLoad(scene_depth, vec2i(uv_r * u.screen.xy), 0).r;
@@ -528,12 +494,12 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
         deep_tint = vec3f(0.03, 0.14, 0.16);
     }
     if stagnant {
-        shallow_col = mix(shallow_col, vec3f(0.10, 0.26, 0.18), 0.12);
-        deep_tint = mix(deep_tint, vec3f(0.03, 0.09, 0.06), 0.12);
+        shallow_col = mix(shallow_col, vec3f(0.10, 0.26, 0.18), 0.6);
+        deep_tint = mix(deep_tint, vec3f(0.03, 0.09, 0.06), 0.6);
     }
     let deep_col = (mix(shallow_col, deep_tint, smoothstep(40.0, 700.0, thick)) +
                     u.horizon.rgb * 0.06) * (0.45 + 0.85 * lum);
-    let absorb = vec3f(0.0120, 0.0046, 0.0030) * select(1.0, 1.15, stagnant) / max(u.screen.w, 0.1);
+    let absorb = vec3f(0.0120, 0.0046, 0.0030) * select(1.0, 2.2, stagnant) / max(u.screen.w, 0.1);
     let trans = exp(-absorb * thick);
     let body = under * trans + deep_col * (vec3f(1.0) - trans);
 
@@ -545,31 +511,25 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let sky = sky_color(vec3f(R_low.x, abs(R_low.y), R_low.z));
     let refl = reflect_ray(world, R_low, sky);
 
-    let shore_calm = mix(0.2, 1.0, smoothstep(4.0, 70.0, thick));
-    var col = mix(body, refl, clamp(fres * 0.85 * shore_calm, 0.0, 0.85));
+    var col = mix(body, refl, clamp(fres * 0.85, 0.0, 0.85));
 
     // Sun glint.
     let sunv = u.sun.xyz;
     let spec = pow(max(dot(R, sunv), 0.0), 600.0) * 3.0 + pow(max(dot(R, sunv), 0.0), 60.0) * 0.15;
     col = col + vec3f(1.0, 0.95, 0.85) * spec * u.sun.w * lum;
 
-    // Water tapers to nothing at the shoreline: the thinner it is, the more of the scene shows.
-    col = mix(under, col, smoothstep(0.0, 5.0, thick));
-    // Shallows still read as water, not bare ground: a veil of the water's own colour, so a shoal
-    // inside the lake does not look like a hole through to the lakebed.
-    let veil = 0.32 * smoothstep(3.0, 30.0, thick);
-    col = mix(col, shallow_col * (0.45 + 0.85 * lum), veil);
-
     // Foam: shoreline (thin water) and wave crests.
     let fn1 = fbm(world.xz * 0.045 + vec2f(t * 0.05, t * 0.03));
     let fn2 = fbm(world.xz * 0.11 - vec2f(t * 0.04, -t * 0.06));
     // A lapping line at the waterline: a bright thin edge plus a broken wash that surges in and out.
-    let surge = 12.0 + 7.0 * sin(t * 0.9 + fn1 * 5.0);
+    let surge = 10.0 + 8.0 * sin(t * 0.9 + fn1 * 5.0);
     let wash = 1.0 - smoothstep(0.0, surge, thick);
-    let edge = 1.0 - smoothstep(0.0, 5.0, thick);
+    let edge = 1.0 - smoothstep(0.0, 3.5, thick);
     let breakup = smoothstep(0.30, 0.62, fn2 * 0.6 + fn1 * 0.5);
     var foam = clamp(wash * breakup * 0.85 + edge * 0.7, 0.0, 1.0);
-
+    if stagnant {
+        foam = foam * 0.3;
+    }
     // Shoreline foam only: it follows the Foam Intensity setting and is never drawn when looking
     // up at the water from underneath.
     foam = foam * clamp(u.sun2.w, 0.0, 2.0);
@@ -577,26 +537,21 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
         foam = 0.0;
     }
     foam = clamp(foam, 0.0, 1.0);
-    // Foam must read as white against whatever is under it, including sunlit sand that is brighter
-    // than the ambient-scaled foam colour: it is never darker than the scene plus a little.
-    let foam_col = clamp(max(vec3f(0.92, 0.96, 0.98) * (0.60 + 0.40 * lum), under * 1.08 + vec3f(0.10)), vec3f(0.0), vec3f(1.0));
-    col = mix(col, foam_col, foam);
+    col = mix(col, vec3f(0.92, 0.96, 0.98) * (0.35 + 0.65 * lum), foam);
 
     // Waterfall foot: churning white splash, with brighter rings where the ripples crest.
     if fall > 0.001 {
-        let churn = smoothstep(0.55, 0.85, fbm(world.xz * 0.16 + vec2f(t * 1.1, -t * 0.8)) * 0.7 +
-                                            fbm(world.xz * 0.41 - vec2f(t * 1.6, t * 0.6)) * 0.45);
-        let crest = smoothstep(0.88, 1.0, fall_ring) * 0.35;
-        let splash = clamp(fall * (0.10 + 0.90 * churn) + fall * crest, 0.0, 1.0);
-        col = mix(col, clamp(max(vec3f(0.94, 0.97, 0.99) * (0.60 + 0.40 * lum), under * 1.08 + vec3f(0.10)), vec3f(0.0), vec3f(1.0)), splash * 0.5);
+        let churn = smoothstep(0.32, 0.70, fbm(world.xz * 0.075 + vec2f(t * 0.9, -t * 0.7)) * 0.7 +
+                                            fbm(world.xz * 0.19 - vec2f(t * 1.3, t * 0.5)) * 0.4);
+        let crest = smoothstep(0.80, 1.0, fall_ring) * 0.5;
+        let splash = clamp(fall * (0.30 + 0.70 * churn) + fall * crest, 0.0, 1.0);
+        col = mix(col, vec3f(0.94, 0.97, 0.99) * (0.40 + 0.60 * lum), splash * 0.9);
     }
 
-    // Wave texture: thin pale contour lines that trace the swell and stretch along the crests, as
-    // in Sunshine's sea. They are contours of the actual wave height, wandered by a slow noise so
-    // they break up and drift; the same density field as the glints makes them busier in patches.
-    if u.eye.y >= world.y {
-        // Contours of a noise field stretched along x: long, thin, sinuous lines that mostly run
-        // across the view, drifting slowly, instead of closed swirls.
+    // Wave texture: long, thin, pale lines like Sunshine's sea. They are contours of a noise field
+    // stretched along x, so they run mostly across the view and drift slowly; the same density field
+    // as the glints makes them busier in patches.
+    if u.eye.y >= world.y && !stagnant {
         let q = vec2f(world.x * 0.0011 + t * 0.012, world.z * 0.0105 - t * 0.02);
         let nf = vnoise(q) * 1.0 + vnoise(q * 2.3 + vec2f(7.0, 3.0)) * 0.5 + w.x * 0.012;
         let c1 = fract(nf * 5.0);
@@ -605,8 +560,8 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
         let l2 = 1.0 - smoothstep(0.0, 0.05, min(c2, 1.0 - c2));
         let breakup2 = smoothstep(0.25, 0.60, vnoise(world.xz * 0.006 + vec2f(-t * 0.05, t * 0.03)));
         let lines = (l1 * 0.8 + l2 * (0.15 + 0.7 * dens)) * breakup2;
-        let line_fade = (1.0 - smoothstep(2500.0, 7000.0, dist)) * smoothstep(20.0, 120.0, info.y) * smoothstep(8.0, 45.0, thick);
-        // Pale highlights added to the water, not a darker tint: they read as light on the surface.
+        let line_fade = (1.0 - smoothstep(2500.0, 7000.0, dist)) * smoothstep(20.0, 120.0, info.y);
+        // Pale highlights added to the water, not a darker tint.
         col = col + vec3f(0.55, 0.60, 0.55) * (0.25 + 0.75 * lum) * clamp(lines * line_fade * (0.20 + 0.22 * dens), 0.0, 0.5);
     }
 
@@ -615,10 +570,10 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     col = mix(col, u.horizon.rgb, clamp(fog, 0.0, 1.0));
 
     // Sparkle: animated glints where the sun or moon catches the facets of the water.
-    if u.eye.y >= world.y {
+    if u.eye.y >= world.y && !stagnant {
         let Rg = reflect(-V, N_w);
         let g = glints(world.xz, dist, t, Rg, u.glint.xyz);
-        col = col + u.glint_col.rgb * g * 6.0 * smoothstep(4.0, 30.0, thick) * (0.4 + 1.4 * dens) * u.glint.w * clamp(u.sun2.w, 0.0, 2.0) *
+        col = col + u.glint_col.rgb * g * 6.0 * (0.4 + 1.4 * dens) * u.glint.w * clamp(u.sun2.w, 0.0, 2.0) *
               (1.0 - 0.5 * clamp(fog, 0.0, 1.0));
     }
 
