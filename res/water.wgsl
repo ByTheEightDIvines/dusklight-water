@@ -145,33 +145,37 @@ fn waves(p: vec2f, t: f32, count: i32, dist: f32) -> vec3f {
     return vec3f(h, dx, dz);
 }
 
-// The Sunshine speckle texture as light flecks. Three bands at growing world scale keep the
-// flecks a similar size on screen from close up to the horizon.
-fn speck_band(p: vec2f, sc: f32, t: f32, seed: f32) -> f32 {
-    let q = p * sc + vec2f(t * 0.0011 * (1.0 + seed), -t * 0.0007) +
-            (vec2f(vnoise(p * sc * 3.1 + seed), vnoise(p * sc * 3.1 + 7.3 + seed)) - 0.5) * 0.4;
-    let v = textureSampleLevel(wave_tex, wave_samp, q, 0.0).r;
-    let tw = 0.55 + 0.45 * sin(t * 2.3 + hash21(floor(q * 24.0)) * 6.2832);
-    return smoothstep(0.08, 0.30, v) * tw;
+// Sun / moon glints: tiny facets of the surface, each tilted a little differently and turning over
+// time, catch the light for an instant when their reflection lines up with the light. Three bands
+// at growing world scale keep the glints a similar size on screen from near to the horizon.
+fn glint_band(p: vec2f, g: f32, t: f32, R: vec3f, L: vec3f, seed: f32) -> f32 {
+    let q = p / g;
+    let id = floor(q) + vec2f(seed * 17.0, seed * 31.0);
+    let f = fract(q) - vec2f(0.5);
+    let h = hash21(id);
+    let a = hash21(id * 1.7 + 3.1) * 6.2832 + t * (0.7 + h * 1.6);
+    let tilt = vec3f(cos(a), 0.0, sin(a)) * (0.03 + 0.20 * hash21(id + 9.7));
+    let Rf = normalize(R + tilt);
+    let along = max(dot(Rf, L), 0.0);
+    let spec = pow(along, 260.0);
+    let shape = smoothstep(0.5, 0.12, length(f));
+    let tw = 0.55 + 0.45 * sin(t * (2.0 + h * 5.0) + h * 40.0);
+    return spec * shape * tw;
 }
 
-fn speck_near(p: vec2f, t: f32) -> f32 {
-    return speck_band(p, 0.0012, t, 0.0);
-}
-
-fn speck_far(p: vec2f, dist: f32, t: f32) -> f32 {
+fn glints(p: vec2f, dist: f32, t: f32, R: vec3f, L: vec3f) -> f32 {
     let w1 = 1.0 - smoothstep(1200.0, 2600.0, dist);
     let w3 = smoothstep(5000.0, 9000.0, dist);
     let w2 = clamp(1.0 - w1 - w3, 0.0, 1.0);
     var s = 0.0;
     if w1 > 0.001 {
-        s = s + w1 * speck_band(p, 0.0012, t, 0.0);
+        s = s + w1 * glint_band(p, 9.0, t, R, L, 0.0);
     }
     if w2 > 0.001 {
-        s = s + w2 * speck_band(p, 0.0003, t, 1.7);
+        s = s + w2 * glint_band(p, 40.0, t, R, L, 1.0);
     }
     if w3 > 0.001 {
-        s = s + w3 * speck_band(p, 0.000075, t, 3.1);
+        s = s + w3 * glint_band(p, 180.0, t, R, L, 2.0);
     }
     return s;
 }
@@ -183,7 +187,7 @@ fn amplitude_scale(open: f32, depth: f32) -> f32 {
 const MIN_DEPTH: f32 = 2.0;        // water shallower than this is left to the stock water
 
 fn usable(info: vec4f) -> bool {
-    return info.w >= 1e-4 && info.z >= 0.01 && info.y >= MIN_DEPTH;
+    return info.w >= 1e-4 && info.y >= MIN_DEPTH;
 }
 
 fn grid_xz(gx: u32, gz: u32) -> vec2f {
@@ -324,8 +328,12 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     // Nearest-cell mask: only open water is replaced; stagnant cells keep the stock water.
     // Smooth (bilinear) openness among the wet neighbours instead of the nearest cell, so the edge
     // of the replaced water follows smooth contours instead of a staircase of lattice cells.
+    // Cells that are wet but not open are still water (ponds, puddles): they get a calm, murky look.
     let open_frac = info.z / max(info.w, 1e-4);
-    if open_frac < 0.5 || info.y < MIN_DEPTH {
+    let stagnant = open_frac < 0.5;
+    // Only about half a lattice cell past the last wet cell is covered; the true shoreline is cut
+    // by the terrain test below.
+    if info.w < 0.5 || info.y < MIN_DEPTH {
         discard;
     }
 
@@ -358,13 +366,14 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let ripple3 = (vnoise(world.xz * 0.23 + vec2f(-t * 0.7, t * 0.5)) - 0.5) * hi_fade;
     let ripple4 = (vnoise(world.xz * 0.47 + vec2f(t * 0.6, t * 0.8)) - 0.5) * hi_fade;
     // N: full detail (glint, refraction). N_low: smooth normal for reflections and Fresnel.
-    var N = normalize(vec3f(-w.y * strength - (ripple + ripple3 * 1.1) * 0.05, 1.0, -w.z * strength - (ripple2 + ripple4 * 1.1) * 0.05));
+    let calm = select(1.0, 0.3, stagnant);
+    var N = normalize(vec3f(-w.y * strength - (ripple + ripple3 * 1.1) * 0.05 * calm, 1.0, -w.z * strength - (ripple2 + ripple4 * 1.1) * 0.05 * calm));
     var N_low = normalize(vec3f(-w_low.y * strength, 1.0, -w_low.z * strength));
 
     // Footsteps and swimming: a turbulent swirl around Link, like the stock spring ripples. It
     // warps the reflection normal and what is seen through the water.
     let sw_r = length(world.xz - u.sun0.xy);
-    let sw_env = u.ripple.x * (1.0 - smoothstep(40.0, 380.0, sw_r)) *
+    let sw_env = select(1.0, 0.0, stagnant) * u.ripple.x * (1.0 - smoothstep(40.0, 380.0, sw_r)) *
                  (0.7 + 0.3 * sin(sw_r * 0.035 - t * 3.0));
     let sw = vec2f(fbm(world.xz * 0.035 + vec2f(t * 0.35, 0.0)) - 0.5,
                    fbm(world.xz * 0.035 + vec2f(5.2, -t * 0.3)) - 0.5) * sw_env;
@@ -377,6 +386,11 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     // Scene beneath the surface.
     let d0 = textureLoad(scene_depth, vec2i(frag.xy), 0).r;
     let scene0 = unproject(uv, d0);
+    // Terrain above the surface (a beach, a rock face) is not water: without this the cover that
+    // hides the stock plane draws the water as a glassy lip over the shore.
+    if u.eye.y >= world.y && scene0.y > world.y + 1.0 + dist * 0.002 && length(scene0 - eye) < 60000.0 {
+        discard;
+    }
     var thick0 = max(world.y - scene0.y, 0.0);
     if length(scene0 - eye) > 60000.0 {
         thick0 = 2000.0;
@@ -412,9 +426,13 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
         shallow_col = vec3f(0.10, 0.40, 0.35);
         deep_tint = vec3f(0.03, 0.14, 0.16);
     }
+    if stagnant {
+        shallow_col = mix(shallow_col, vec3f(0.10, 0.26, 0.18), 0.6);
+        deep_tint = mix(deep_tint, vec3f(0.03, 0.09, 0.06), 0.6);
+    }
     let deep_col = (mix(shallow_col, deep_tint, smoothstep(40.0, 700.0, thick)) +
                     u.horizon.rgb * 0.06) * (0.45 + 0.85 * lum);
-    let absorb = vec3f(0.0120, 0.0046, 0.0030) / max(u.screen.w, 0.1);
+    let absorb = vec3f(0.0120, 0.0046, 0.0030) * select(1.0, 2.2, stagnant) / max(u.screen.w, 0.1);
     let trans = exp(-absorb * thick);
     let body = under * trans + deep_col * (vec3f(1.0) - trans);
 
@@ -436,9 +454,15 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     // Foam: shoreline (thin water) and wave crests.
     let fn1 = fbm(world.xz * 0.045 + vec2f(t * 0.05, t * 0.03));
     let fn2 = fbm(world.xz * 0.11 - vec2f(t * 0.04, -t * 0.06));
-    let shore = (1.0 - smoothstep(3.0, 26.0, thick)) * smoothstep(0.0, 4.0, thick + 2.0);
-    let band = 0.5 + 0.5 * sin(thick * 0.14 - t * 1.3 + fn1 * 6.0);
-    var foam = shore * smoothstep(0.45, 0.9, fn1 * 0.7 + band * 0.35 + fn2 * 0.25) * 0.8;
+    // A lapping line at the waterline: a bright thin edge plus a broken wash that surges in and out.
+    let surge = 10.0 + 8.0 * sin(t * 0.9 + fn1 * 5.0);
+    let wash = 1.0 - smoothstep(0.0, surge, thick);
+    let edge = 1.0 - smoothstep(0.0, 3.5, thick);
+    let breakup = smoothstep(0.30, 0.62, fn2 * 0.6 + fn1 * 0.5);
+    var foam = clamp(wash * breakup * 0.85 + edge * 0.7, 0.0, 1.0);
+    if stagnant {
+        foam = foam * 0.3;
+    }
     // Shoreline foam only: it follows the Foam Intensity setting and is never drawn when looking
     // up at the water from underneath.
     foam = foam * clamp(u.sun2.w, 0.0, 2.0);
@@ -452,21 +476,12 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let fog = 1.0 - exp(-dist * u.params.w);
     col = mix(col, u.horizon.rgb, clamp(fog, 0.0, 1.0));
 
-    // Sparkle: the Sunshine speckle texture, seen as ripple flecks around Link and as a glittering
-    // path toward the sun or moon that stays visible all the way to the horizon.
-    if u.eye.y >= world.y {
-        let lum_s = clamp(luminance(u.amb.rgb) * 1.4, 0.12, 1.0);
-        // Dense scrolling flecks near the camera (two layers drifting differently).
-        let near_w = 1.0 - smoothstep(1500.0, 4200.0, dist);
-        let fl = max(speck_band(world.xz, 0.0012, t, 0.0), speck_band(world.xz + vec2f(311.0, 127.0), 0.0019, t, 2.3));
-        col = col + vec3f(0.92, 0.97, 1.0) * (0.30 + 0.70 * lum_s) * fl * 0.6 * near_w * clamp(u.sun2.w, 0.0, 2.0);
-
-        let Rg = reflect(-V, N_low);
-        let along = max(dot(Rg, u.glint.xyz), 0.0);
-        let lobe = pow(along, 6.0) * 0.8 + pow(along, 40.0) * 1.0;
-        let flecks = speck_far(world.xz, dist, t);
-        let glitter = flecks * (0.06 + lobe * 3.2) * u.glint.w * clamp(u.sun2.w, 0.0, 2.0);
-        col = col + u.glint_col.rgb * glitter * (1.0 - 0.5 * clamp(fog, 0.0, 1.0));
+    // Sparkle: animated glints where the sun or moon catches the facets of the water.
+    if u.eye.y >= world.y && !stagnant {
+        let Rg = reflect(-V, N);
+        let g = glints(world.xz, dist, t, Rg, u.glint.xyz);
+        col = col + u.glint_col.rgb * g * 7.0 * u.glint.w * clamp(u.sun2.w, 0.0, 2.0) *
+              (1.0 - 0.5 * clamp(fog, 0.0, 1.0));
     }
 
     // Debug views: 1 = water mask, 2 = depth/thickness, 3 = normals.
