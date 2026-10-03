@@ -53,6 +53,8 @@ struct VOut {
 
 // Level 0 = fine lattice (near the camera), level 1 = coarse lattice (far reach). Both live in
 // one storage buffer: fine cells first, then coarse cells.
+const kStepLimit: f32 = 40.0;      // largest height difference blended or spanned by one surface quad
+
 fn use_fine(xz: vec2f) -> bool {
     let d = max(abs(xz.x - u.eye.x), abs(xz.y - u.eye.z));
     return d < u.warp.z;
@@ -88,20 +90,28 @@ fn surface_info(xz: vec2f) -> vec4f {
     let w10 = f.x * (1.0 - f.y);
     let w01 = (1.0 - f.x) * f.y;
     let w11 = f.x * f.y;
-    let a00 = select(0.0, w00, s00.z > 0.5);
-    let a10 = select(0.0, w10, s10.z > 0.5);
-    let a01 = select(0.0, w01, s01.z > 0.5);
-    let a11 = select(0.0, w11, s11.z > 0.5);
+    // Water at very different heights (a pool below a waterfall and the ledge above it) must never
+    // be blended into a ramp: only corners near the height of the heaviest wet corner count.
+    var w_ref = 0.0;
+    var h_ref = 0.0;
+    if s00.z > 0.5 && w00 > w_ref { w_ref = w00; h_ref = s00.x; }
+    if s10.z > 0.5 && w10 > w_ref { w_ref = w10; h_ref = s10.x; }
+    if s01.z > 0.5 && w01 > w_ref { w_ref = w01; h_ref = s01.x; }
+    if s11.z > 0.5 && w11 > w_ref { w_ref = w11; h_ref = s11.x; }
+    let a00 = select(0.0, w00, s00.z > 0.5 && abs(s00.x - h_ref) < kStepLimit);
+    let a10 = select(0.0, w10, s10.z > 0.5 && abs(s10.x - h_ref) < kStepLimit);
+    let a01 = select(0.0, w01, s01.z > 0.5 && abs(s01.x - h_ref) < kStepLimit);
+    let a11 = select(0.0, w11, s11.z > 0.5 && abs(s11.x - h_ref) < kStepLimit);
     let sum = a00 + a10 + a01 + a11;
     if sum < 1e-4 {
         return vec4f(0.0);
     }
     let h = (s00.x * a00 + s10.x * a10 + s01.x * a01 + s11.x * a11) / sum;
     let d = (s00.y * a00 + s10.y * a10 + s01.y * a01 + s11.y * a11) / sum;
-    let o00 = select(0.0, w00, s00.z > 1.5);
-    let o10 = select(0.0, w10, s10.z > 1.5);
-    let o01 = select(0.0, w01, s01.z > 1.5);
-    let o11 = select(0.0, w11, s11.z > 1.5);
+    let o00 = select(0.0, w00, s00.z > 1.5 && a00 > 0.0);
+    let o10 = select(0.0, w10, s10.z > 1.5 && a10 > 0.0);
+    let o01 = select(0.0, w01, s01.z > 1.5 && a01 > 0.0);
+    let o11 = select(0.0, w11, s11.z > 1.5 && a11 > 0.0);
     return vec4f(h, d, o00 + o10 + o01 + o11, sum);
 }
 
@@ -217,15 +227,20 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
 
     var hsum = 0.0;
     var count = 0.0;
+    var hmin = 1e9;
+    var hmax = -1e9;
     for (var k = 0u; k < 4u; k = k + 1u) {
         let p = grid_xz(qx + (k & 1u), qz + (k >> 1u));
         let ci = surface_info(p);
         if usable(ci) {
             hsum = hsum + ci.x;
             count = count + 1.0;
+            hmin = min(hmin, ci.x);
+            hmax = max(hmax, ci.x);
         }
     }
-    if count < 0.5 {
+    // A quad spanning a step (waterfall face, ledge) is dropped so no sheet slopes across it.
+    if count < 0.5 || hmax - hmin > kStepLimit {
         o.pos = vec4f(2.0, 2.0, 2.0, 1.0); // whole quad dry: all six vertices collapse together
         o.world = vec3f(0.0);
         return o;
