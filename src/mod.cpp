@@ -25,6 +25,8 @@
 #include "mods/svc/ui.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <string>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -366,6 +368,54 @@ constexpr float kSwellScale = 0.72f;
 constexpr int kWaveCountVertex = 5;
 
 bool g_snapshotReady = false;
+
+// Diagnostics: a few times per session, write a map of the fine lattice around the player to the
+// log, so odd holes in the water can be diagnosed from real data. Each character is one 64 unit
+// cell: '.' no water found, 'S' stagnant, 'o' open water at the player's water height (within
+// 20 units), 'a'..'e' open water 20-100+ units above it, 'A'..'E' below it, '+' grown cell.
+void dump_lattice_diagnostics() {
+    static float nextAt = 25.0f;
+    static int dumps = 0;
+    const float now = elapsed_seconds();
+    if (now < nextAt || dumps >= 8) {
+        return;
+    }
+    nextAt = now + 15.0f;
+    ++dumps;
+    constexpr int W = kLatticeWidth;
+    const int pi = static_cast<int>(std::floor(g_framePlayer[0] / kFineCell)) - g_fine.ix0;
+    const int pj = static_cast<int>(std::floor(g_framePlayer[2] / kFineCell)) - g_fine.iz0;
+    char line[256];
+    std::snprintf(line, sizeof(line),
+        "lattice dump %d: player cell (%d,%d) refY=%.0f playerY=%.0f; 'o'=player water level, "
+        "a-e above, A-E below, S stagnant, .=none",
+        dumps, pi, pj, g_refY, g_framePlayer[1]);
+    svc_log->info(mod_ctx, line);
+    constexpr int R = 20;
+    for (int j = std::max(pj - R, 0); j <= std::min(pj + R, W - 1); ++j) {
+        std::string row;
+        for (int i = std::max(pi - R, 0); i <= std::min(pi + R, W - 1); ++i) {
+            const std::array<float, 4>& c = g_snapshot[j * W + i];
+            char ch = '.';
+            if (i == pi && j == pj) {
+                ch = '@';
+            } else if (c[2] > 0.5f) {
+                const float d = c[0] - g_refY;
+                if (c[2] < 1.5f) {
+                    ch = 'S';
+                } else if (std::fabs(d) <= 20.0f) {
+                    ch = 'o';
+                } else if (d > 0.0f) {
+                    ch = static_cast<char>('a' + std::min(4, static_cast<int>(d / 40.0f)));
+                } else {
+                    ch = static_cast<char>('A' + std::min(4, static_cast<int>(-d / 40.0f)));
+                }
+            }
+            row.push_back(ch);
+        }
+        svc_log->info(mod_ctx, row.c_str());
+    }
+}
 
 // Waterfall spray emitters: places where a fine-tier water cell has a much higher water cell right
 // next to it (the pool at the foot of a fall and the ledge above it).
@@ -1134,6 +1184,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const bool coarseOpen = update_lattice(
         g_coarse, g_snapshot.data() + kLatticeWidth * kLatticeWidth, camera, playerY);
     update_spray(camera);
+    dump_lattice_diagnostics();
     // Nothing open nearby: skip the draw entirely.
     if (!fineOpen && !coarseOpen) {
         return;
