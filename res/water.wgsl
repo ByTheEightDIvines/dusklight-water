@@ -180,7 +180,7 @@ fn amplitude_scale(open: f32, depth: f32) -> f32 {
     return u.params.y * open * smoothstep(40.0, 320.0, depth);
 }
 
-const MIN_DEPTH: f32 = 8.0;        // water shallower than this is left to the stock water
+const MIN_DEPTH: f32 = 2.0;        // water shallower than this is left to the stock water
 
 fn usable(info: vec4f) -> bool {
     return info.w >= 1e-4 && info.z >= 0.01 && info.y >= MIN_DEPTH;
@@ -322,15 +322,10 @@ fn reflect_ray(p: vec3f, r: vec3f, fallback: vec3f) -> vec3f {
 fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let info = surface_info(world.xz);
     // Nearest-cell mask: only open water is replaced; stagnant cells keep the stock water.
-    var here: vec4f;
-    if use_fine(world.xz) {
-        let cell = vec2i(floor(world.xz / u.lat.w) - u.lat.xy);
-        here = cell_at(0, cell.x, cell.y);
-    } else {
-        let cell = vec2i(floor(world.xz / u.lat2.w) - u.lat2.xy);
-        here = cell_at(1, cell.x, cell.y);
-    }
-    if here.z < 1.5 || info.y < MIN_DEPTH {
+    // Smooth (bilinear) openness among the wet neighbours instead of the nearest cell, so the edge
+    // of the replaced water follows smooth contours instead of a staircase of lattice cells.
+    let open_frac = info.z / max(info.w, 1e-4);
+    if open_frac < 0.5 || info.y < MIN_DEPTH {
         discard;
     }
 
@@ -366,6 +361,16 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     var N = normalize(vec3f(-w.y * strength - (ripple + ripple3 * 1.1) * 0.05, 1.0, -w.z * strength - (ripple2 + ripple4 * 1.1) * 0.05));
     var N_low = normalize(vec3f(-w_low.y * strength, 1.0, -w_low.z * strength));
 
+    // Footsteps and swimming: a turbulent swirl around Link, like the stock spring ripples. It
+    // warps the reflection normal and what is seen through the water.
+    let sw_r = length(world.xz - u.sun0.xy);
+    let sw_env = u.ripple.x * (1.0 - smoothstep(40.0, 380.0, sw_r)) *
+                 (0.7 + 0.3 * sin(sw_r * 0.035 - t * 3.0));
+    let sw = vec2f(fbm(world.xz * 0.035 + vec2f(t * 0.35, 0.0)) - 0.5,
+                   fbm(world.xz * 0.035 + vec2f(5.2, -t * 0.3)) - 0.5) * sw_env;
+    N = normalize(vec3f(N.x + sw.x * 1.4, N.y, N.z + sw.y * 1.4));
+    N_low = normalize(vec3f(N_low.x + sw.x, N_low.y, N_low.z + sw.y));
+
     let uv = frag.xy / u.screen.xy;
     let size = vec2i(u.screen.xy);
 
@@ -378,7 +383,8 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     }
 
     // Refraction: offset by the normal, but never pull in something in front of the water.
-    var uv_r = uv + N.xz * 0.03 * clamp(thick0 / 120.0, 0.0, 1.0) * u.screen.w;
+    var uv_r = uv + N.xz * 0.03 * clamp(thick0 / 120.0, 0.0, 1.0) * u.screen.w +
+               sw * 0.14 * clamp(thick0 / 40.0, 0.25, 1.0) * u.screen.w;
     uv_r = clamp(uv_r, vec2f(0.002), vec2f(0.998));
     let d_r = textureLoad(scene_depth, vec2i(uv_r * u.screen.xy), 0).r;
     let scene_r = unproject(uv_r, d_r);
