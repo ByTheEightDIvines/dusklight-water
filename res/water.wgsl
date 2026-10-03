@@ -1,0 +1,317 @@
+// Better Water: wave surface drawn after opaque scene geometry.
+//
+// The surface is a camera-following grid generated entirely from vertex_index (no vertex buffer).
+// A coarse lattice of collision water queries (built on the CPU, one vec4 per cell:
+// height, depth, state, 0) decides where water is, how high it is and whether it is open water
+// (waves) or stagnant (left to the stock renderer). Depth is written so the stock water material
+// (depth test LEQUAL, no depth write) is hidden wherever this surface is in front of it.
+
+struct U {
+    proj_from_world: mat4x4f,
+    world_from_proj: mat4x4f,
+    eye: vec4f,      // xyz camera position
+    sky: vec4f,      // zenith colour
+    horizon: vec4f,  // horizon / fog colour
+    amb: vec4f,      // ambient light colour (brightness of the scene)
+    sun: vec4f,      // xyz direction to the sun, w = visibility
+    params: vec4f,   // x time, y wave height scale, z normal strength, w fog density
+    grid: vec4f,     // x origin, y origin, z step, w quads per side
+    lat: vec4f,      // x ix0, y iz0, z width, w cell size
+    screen: vec4f,   // x width, y height, z debug mode, w clarity
+}
+
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var<storage, read> lattice: array<vec4f>;
+@group(0) @binding(2) var scene_color: texture_2d<f32>;
+@group(0) @binding(3) var scene_depth: texture_2d<f32>;
+@group(0) @binding(4) var samp: sampler;
+
+const WAVE_COUNT_VERTEX: i32 = 4;
+const WAVE_COUNT_FRAG: i32 = 8;
+const BASE_AMPLITUDE: f32 = 16.0;   // world units (1 unit is about 1 cm), scaled by params.y
+const BASE_WAVELENGTH: f32 = 900.0;
+const SURFACE_LIFT: f32 = 2.0;      // keeps the surface just above the stock water plane
+
+struct VOut {
+    @builtin(position) pos: vec4f,
+    @location(0) world: vec3f,
+}
+
+fn cell_at(i: i32, j: i32) -> vec4f {
+    let w = i32(u.lat.z);
+    if i < 0 || j < 0 || i >= w || j >= w {
+        return vec4f(0.0);
+    }
+    return lattice[u32(j * w + i)];
+}
+
+// Bilinear lattice query. Returns (height, depth, openness, anyWater)
+fn surface_info(xz: vec2f) -> vec4f {
+    let c = xz / u.lat.w - u.lat.xy - vec2f(0.5);
+    let b = floor(c);
+    let f = c - b;
+    let bi = vec2i(b);
+    let s00 = cell_at(bi.x, bi.y);
+    let s10 = cell_at(bi.x + 1, bi.y);
+    let s01 = cell_at(bi.x, bi.y + 1);
+    let s11 = cell_at(bi.x + 1, bi.y + 1);
+    let w00 = (1.0 - f.x) * (1.0 - f.y);
+    let w10 = f.x * (1.0 - f.y);
+    let w01 = (1.0 - f.x) * f.y;
+    let w11 = f.x * f.y;
+    let a00 = select(0.0, w00, s00.z > 0.5);
+    let a10 = select(0.0, w10, s10.z > 0.5);
+    let a01 = select(0.0, w01, s01.z > 0.5);
+    let a11 = select(0.0, w11, s11.z > 0.5);
+    let sum = a00 + a10 + a01 + a11;
+    if sum < 1e-4 {
+        return vec4f(0.0);
+    }
+    let h = (s00.x * a00 + s10.x * a10 + s01.x * a01 + s11.x * a11) / sum;
+    let d = (s00.y * a00 + s10.y * a10 + s01.y * a01 + s11.y * a11) / sum;
+    let o00 = select(0.0, w00, s00.z > 1.5);
+    let o10 = select(0.0, w10, s10.z > 1.5);
+    let o01 = select(0.0, w01, s01.z > 1.5);
+    let o11 = select(0.0, w11, s11.z > 1.5);
+    return vec4f(h, d, o00 + o10 + o01 + o11, sum);
+}
+
+// Sum of sharp-crested waves, exp(sin - 1): always >= 0, so the surface never dips below the
+// stock water plane (which would let it show through). Returns (height, d/dx, d/dz).
+fn waves(p: vec2f, t: f32, count: i32) -> vec3f {
+    var h = 0.0;
+    var dx = 0.0;
+    var dz = 0.0;
+    for (var i = 0; i < count; i = i + 1) {
+        let fi = f32(i);
+        let angle = 0.6 + fi * 2.399963;
+        let dir = vec2f(cos(angle), sin(angle));
+        let wl = BASE_WAVELENGTH * pow(0.55, fi);
+        let k = 6.2831853 / wl;
+        let omega = sqrt(980.0 * k) * 0.6;
+        let amp = BASE_AMPLITUDE * pow(0.62, fi);
+        let th = k * dot(dir, p) - omega * t + fi * 1.7;
+        let e = exp(sin(th) - 1.0);
+        h = h + amp * e;
+        let d = amp * e * cos(th) * k;
+        dx = dx + d * dir.x;
+        dz = dz + d * dir.y;
+    }
+    return vec3f(h, dx, dz);
+}
+
+fn amplitude_scale(open: f32, depth: f32) -> f32 {
+    return u.params.y * open * smoothstep(40.0, 320.0, depth);
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
+    var o: VOut;
+    let n = u32(u.grid.w);
+    let quad = vi / 6u;
+    let corner = vi % 6u;
+    var cx = array<u32, 6>(0u, 1u, 0u, 1u, 1u, 0u);
+    var cz = array<u32, 6>(0u, 0u, 1u, 0u, 1u, 1u);
+    let gx = quad % n + cx[corner];
+    let gz = quad / n + cz[corner];
+    let half = f32(n) * 0.5;
+    let x = u.grid.x + (f32(gx) - half) * u.grid.z;
+    let z = u.grid.y + (f32(gz) - half) * u.grid.z;
+
+    let info = surface_info(vec2f(x, z));
+    if info.w < 1e-4 || info.z < 0.01 {
+        o.pos = vec4f(2.0, 2.0, 2.0, 1.0); // outside clip volume: culled
+        o.world = vec3f(0.0);
+        return o;
+    }
+    let w = waves(vec2f(x, z), u.params.x, WAVE_COUNT_VERTEX);
+    let y = info.x + SURFACE_LIFT + w.x * amplitude_scale(info.z, info.y);
+    let world = vec3f(x, y, z);
+    o.world = world;
+    o.pos = u.proj_from_world * vec4f(world, 1.0);
+    return o;
+}
+
+fn unproject(uv: vec2f, d: f32) -> vec3f {
+    let ndc = vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let w = u.world_from_proj * vec4f(ndc, d, 1.0);
+    return w.xyz / w.w;
+}
+
+fn hash21(p: vec2f) -> f32 {
+    var q = fract(p * vec2f(123.34, 456.21));
+    q = q + dot(q, q + 45.32);
+    return fract(q.x * q.y);
+}
+
+fn vnoise(p: vec2f) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let s = f * f * (3.0 - 2.0 * f);
+    let a = hash21(i);
+    let b = hash21(i + vec2f(1.0, 0.0));
+    let c = hash21(i + vec2f(0.0, 1.0));
+    let d = hash21(i + vec2f(1.0, 1.0));
+    return mix(mix(a, b, s.x), mix(c, d, s.x), s.y);
+}
+
+fn fbm(p: vec2f) -> f32 {
+    var v = 0.0;
+    var a = 0.5;
+    var q = p;
+    for (var i = 0; i < 4; i = i + 1) {
+        v = v + a * vnoise(q);
+        q = q * 2.03 + vec2f(17.1, 9.2);
+        a = a * 0.5;
+    }
+    return v;
+}
+
+fn luminance(c: vec3f) -> f32 {
+    return dot(c, vec3f(0.299, 0.587, 0.114));
+}
+
+fn sky_color(dir: vec3f) -> vec3f {
+    let t = clamp(dir.y * 1.6, 0.0, 1.0);
+    return mix(u.horizon.rgb, u.sky.rgb, t);
+}
+
+// Screen-space reflection: geometric ray march against the scene depth snapshot.
+fn reflect_ray(p: vec3f, r: vec3f, fallback: vec3f) -> vec3f {
+    let size = u.screen.xy;
+    var t = 30.0;
+    for (var i = 0; i < 32; i = i + 1) {
+        let q = p + r * t;
+        let clip = u.proj_from_world * vec4f(q, 1.0);
+        if clip.w <= 0.0 {
+            break;
+        }
+        let ndc = clip.xyz / clip.w;
+        let uv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0 {
+            break;
+        }
+        let pix = vec2i(uv * size);
+        let d = textureLoad(scene_depth, pix, 0).r;
+        let sw = unproject(uv, d);
+        let dist_scene = length(sw - u.eye.xyz);
+        let dist_ray = length(q - u.eye.xyz);
+        let thickness = 25.0 + t * 0.12;
+        if dist_ray > dist_scene && dist_ray - dist_scene < thickness && sw.y > p.y {
+            let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+            let c = textureSampleLevel(scene_color, samp, uv, 0.0).rgb;
+            return mix(fallback, c, smoothstep(0.0, 0.08, edge));
+        }
+        t = t * 1.17;
+    }
+    return fallback;
+}
+
+@fragment
+fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> @location(0) vec4f {
+    let info = surface_info(world.xz);
+    // Nearest-cell mask: only open water is replaced; stagnant cells keep the stock water.
+    let cell = vec2i(floor(world.xz / u.lat.w) - u.lat.xy);
+    let here = cell_at(cell.x, cell.y);
+    if here.z < 1.5 {
+        discard;
+    }
+
+    let eye = u.eye.xyz;
+    let to_eye = eye - world;
+    let dist = length(to_eye);
+    let V = to_eye / dist;
+
+    // Fade out toward the edge of the replaced region: dithered, because depth is written.
+    let edge_fade = smoothstep(0.80, 1.0, length(world.xz - eye.xz) / (u.grid.w * u.grid.z * 0.5));
+    if edge_fade > hash21(frag.xy) {
+        discard;
+    }
+
+    let t = u.params.x;
+    let a_scale = amplitude_scale(info.z, info.y);
+    let shallow = smoothstep(20.0, 260.0, info.y);
+
+    // Normal: large waves + extra small octaves that only exist as shading.
+    let w = waves(world.xz, t, WAVE_COUNT_FRAG);
+    let strength = u.params.z * mix(0.35, 1.0, shallow) * max(u.params.y, 0.15);
+    // Small ripples are always present, even if the big swell is turned down.
+    let ripple = vnoise(world.xz * 0.05 + vec2f(t * 0.4, -t * 0.3)) - 0.5;
+    let ripple2 = vnoise(world.xz * 0.11 - vec2f(t * 0.5, t * 0.2)) - 0.5;
+    var N = normalize(vec3f(-w.y * strength - ripple * 0.06, 1.0, -w.z * strength - ripple2 * 0.06));
+
+    let uv = frag.xy / u.screen.xy;
+    let size = vec2i(u.screen.xy);
+
+    // Scene beneath the surface.
+    let d0 = textureLoad(scene_depth, vec2i(frag.xy), 0).r;
+    let scene0 = unproject(uv, d0);
+    var thick0 = max(world.y - scene0.y, 0.0);
+    if length(scene0 - eye) > 60000.0 {
+        thick0 = 2000.0;
+    }
+
+    // Refraction: offset by the normal, but never pull in something in front of the water.
+    var uv_r = uv + N.xz * 0.03 * clamp(thick0 / 120.0, 0.0, 1.0) * u.screen.w;
+    uv_r = clamp(uv_r, vec2f(0.002), vec2f(0.998));
+    let d_r = textureLoad(scene_depth, vec2i(uv_r * u.screen.xy), 0).r;
+    let scene_r = unproject(uv_r, d_r);
+    var thick = thick0;
+    var under_uv = uv;
+    if length(scene_r - eye) > dist * 0.98 {
+        under_uv = uv_r;
+        thick = max(world.y - scene_r.y, 0.0);
+        if length(scene_r - eye) > 60000.0 {
+            thick = 2000.0;
+        }
+    }
+    let under = textureSampleLevel(scene_color, samp, under_uv, 0.0).rgb;
+
+    // Absorption: red goes first, then green, blue lasts longest.
+    let lum = clamp(luminance(u.amb.rgb) * 1.4, 0.12, 1.0);
+    let deep_col = vec3f(0.020, 0.115, 0.130) * lum + u.sky.rgb * 0.05;
+    let absorb = vec3f(0.0120, 0.0046, 0.0030) / max(u.screen.w, 0.1);
+    let trans = exp(-absorb * thick);
+    let body = under * trans + deep_col * (vec3f(1.0) - trans);
+
+    // Reflection.
+    let cosv = clamp(dot(N, V), 0.0, 1.0);
+    let fres = 0.02 + 0.98 * pow(1.0 - cosv, 5.0);
+    let R = reflect(-V, N);
+    let sky = sky_color(vec3f(R.x, abs(R.y), R.z));
+    let refl = reflect_ray(world, R, sky);
+
+    var col = mix(body, refl, clamp(fres * 1.15, 0.0, 0.95));
+
+    // Sun glint.
+    let sunv = u.sun.xyz;
+    let spec = pow(max(dot(R, sunv), 0.0), 600.0) * 3.0 + pow(max(dot(R, sunv), 0.0), 60.0) * 0.15;
+    col = col + vec3f(1.0, 0.95, 0.85) * spec * u.sun.w * lum;
+
+    // Foam: shoreline (thin water) and wave crests.
+    let fn1 = fbm(world.xz * 0.045 + vec2f(t * 0.05, t * 0.03));
+    let fn2 = fbm(world.xz * 0.11 - vec2f(t * 0.04, -t * 0.06));
+    let shore = (1.0 - smoothstep(4.0, 55.0, thick)) * smoothstep(0.0, 6.0, thick + 3.0);
+    let band = 0.5 + 0.5 * sin(thick * 0.14 - t * 1.3 + fn1 * 6.0);
+    var foam = shore * smoothstep(0.30, 0.70, fn1 * 0.6 + band * 0.55);
+    let crest = smoothstep(0.62, 0.95, w.x / (BASE_AMPLITUDE * 0.9)) * clamp(a_scale, 0.0, 1.0);
+    foam = foam + crest * smoothstep(0.45, 0.75, fn2) * 0.8;
+    foam = clamp(foam, 0.0, 1.0);
+    col = mix(col, vec3f(0.92, 0.96, 0.98) * (0.35 + 0.65 * lum), foam);
+
+    // Distance fog toward the scene fog colour.
+    let fog = 1.0 - exp(-dist * u.params.w);
+    col = mix(col, u.horizon.rgb, clamp(fog, 0.0, 1.0));
+
+    // Debug views: 1 = water mask, 2 = depth/thickness, 3 = normals.
+    if u.screen.z > 0.5 {
+        if u.screen.z < 1.5 {
+            return vec4f(0.1, 0.9, 0.3, 1.0);
+        } else if u.screen.z < 2.5 {
+            return vec4f(vec3f(clamp(thick / 400.0, 0.0, 1.0)), 1.0);
+        } else {
+            return vec4f(N * 0.5 + 0.5, 1.0);
+        }
+    }
+    return vec4f(max(col, vec3f(0.0)), 1.0);
+}

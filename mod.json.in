@@ -1,0 +1,7 @@
+{
+  "id": "com.bytheeightdivines.dusklight_water",
+  "name": "Better Water",
+  "version": "@PROJECT_VERSION@",
+  "author": "ByTheEightDivines",
+  "description": "Replaces the flat scrolling-texture water of lakes, rivers and the sea with a real wave surface: animated waves, refraction, reflections, depth tint and shoreline foam. Potion pots and puddles stay still and stagnant. AI was used in assistance in creating this mod."
+}
