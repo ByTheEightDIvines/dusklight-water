@@ -54,7 +54,7 @@ struct VOut {
 
 // Level 0 = fine lattice (near the camera), level 1 = coarse lattice (far reach). Both live in
 // one storage buffer: fine cells first, then coarse cells.
-const kStepLimit: f32 = 40.0;      // largest height difference blended or spanned by one surface quad
+const kStepLimit: f32 = 80.0;      // largest height difference blended or spanned by one surface quad
 
 fn use_fine(xz: vec2f) -> bool {
     let d = max(abs(xz.x - u.eye.x), abs(xz.y - u.eye.z));
@@ -234,7 +234,7 @@ fn amplitude_scale(open: f32, depth: f32) -> f32 {
     return u.params.y * open * smoothstep(40.0, 320.0, depth);
 }
 
-const MIN_DEPTH: f32 = 2.0;        // water shallower than this is left to the stock water
+const MIN_DEPTH: f32 = -1.0;        // water shallower than this is left to the stock water
 
 fn usable(info: vec4f) -> bool {
     return info.w >= 1e-4 && info.y >= MIN_DEPTH;
