@@ -24,6 +24,8 @@ struct U {
     sun1: vec4f,     // Sunshine overlay: x,y wave amplitudes, z,w texture scroll
     sun2: vec4f,     // Sunshine overlay: xyz colour tint, w intensity
     ripple: vec4f,   // x swim ripple intensity (0 = Link is not in the water)
+    glint: vec4f,    // xyz direction to the sun or moon (whichever is up), w visibility
+    glint_col: vec4f, // rgb colour of that light
 }
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -143,10 +145,10 @@ fn waves(p: vec2f, t: f32, count: i32, dist: f32) -> vec3f {
     return vec3f(h, dx, dz);
 }
 
-// Swim ripples: irregular rings spreading from Link (real height, so they catch light and reflect).
-fn ripple_h(p: vec2f, t: f32) -> f32 {
+// Swim ripples: irregular rings spreading from Link. Returns (strength, wobbled radius).
+fn ripple_ring(p: vec2f, t: f32) -> vec2f {
     if u.ripple.x < 0.001 {
-        return 0.0;
+        return vec2f(0.0);
     }
     let pr = p - u.sun0.xy;
     let r0 = max(length(pr), 1.0);
@@ -155,7 +157,43 @@ fn ripple_h(p: vec2f, t: f32) -> f32 {
     let r = r0 + (24.0 * sin(3.0 * ang + t * 0.6) + 14.0 * sin(5.0 * ang - t * 0.8 + 1.7)) *
                  smoothstep(40.0, 260.0, r0);
     let env = (1.0 - smoothstep(80.0, 560.0, r0)) * smoothstep(30.0, 100.0, r0) * u.ripple.x;
-    return env * (3.5 * sin(r * 0.042 - t * 4.2) + 1.6 * sin(r * 0.083 - t * 6.6 + 1.0));
+    return vec2f(env, r);
+}
+
+fn ripple_h(p: vec2f, t: f32) -> f32 {
+    let rr = ripple_ring(p, t);
+    return rr.x * (3.5 * sin(rr.y * 0.042 - t * 4.2) + 1.6 * sin(rr.y * 0.083 - t * 6.6 + 1.0));
+}
+
+// The Sunshine speckle texture as light flecks. Three bands at growing world scale keep the
+// flecks a similar size on screen from close up to the horizon.
+fn speck_band(p: vec2f, sc: f32, t: f32, seed: f32) -> f32 {
+    let q = p * sc + vec2f(t * 0.0011 * (1.0 + seed), -t * 0.0007) +
+            (vec2f(vnoise(p * sc * 3.1 + seed), vnoise(p * sc * 3.1 + 7.3 + seed)) - 0.5) * 0.4;
+    let v = textureSampleLevel(wave_tex, wave_samp, q, 0.0).r;
+    let tw = 0.55 + 0.45 * sin(t * 2.3 + hash21(floor(q * 24.0)) * 6.2832);
+    return smoothstep(0.08, 0.30, v) * tw;
+}
+
+fn speck_near(p: vec2f, t: f32) -> f32 {
+    return speck_band(p, 0.0012, t, 0.0);
+}
+
+fn speck_far(p: vec2f, dist: f32, t: f32) -> f32 {
+    let w1 = 1.0 - smoothstep(1200.0, 2600.0, dist);
+    let w3 = smoothstep(5000.0, 9000.0, dist);
+    let w2 = clamp(1.0 - w1 - w3, 0.0, 1.0);
+    var s = 0.0;
+    if w1 > 0.001 {
+        s = s + w1 * speck_band(p, 0.0012, t, 0.0);
+    }
+    if w2 > 0.001 {
+        s = s + w2 * speck_band(p, 0.0003, t, 1.7);
+    }
+    if w3 > 0.001 {
+        s = s + w3 * speck_band(p, 0.000075, t, 3.1);
+    }
+    return s;
 }
 
 fn amplitude_scale(open: f32, depth: f32) -> f32 {
@@ -351,7 +389,6 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     let ripple_gz = (ripple_h(world.xz + vec2f(0.0, 6.0), t) - ripple_c) / 6.0;
     N = normalize(vec3f(N.x - ripple_gx * 0.8, N.y, N.z - ripple_gz * 0.8));
     N_low = normalize(vec3f(N_low.x - ripple_gx * 0.5, N_low.y, N_low.z - ripple_gz * 0.5));
-    let ring_foam = 0.0;
 
     let uv = frag.xy / u.screen.xy;
     let size = vec2i(u.screen.xy);
@@ -422,7 +459,7 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     var foam = shore * smoothstep(0.22, 0.85, fn1 * 0.6 + band * 0.55);
     // Shoreline foam only: it follows the Foam Intensity setting and is never drawn when looking
     // up at the water from underneath.
-    foam = foam * clamp(u.sun2.w, 0.0, 2.0) + ring_foam;
+    foam = foam * clamp(u.sun2.w, 0.0, 2.0);
     if u.eye.y < world.y {
         foam = 0.0;
     }
@@ -432,6 +469,23 @@ fn shade_water(frag: vec4f, world: vec3f) -> vec4f {
     // Distance fog toward the scene fog colour.
     let fog = 1.0 - exp(-dist * u.params.w);
     col = mix(col, u.horizon.rgb, clamp(fog, 0.0, 1.0));
+
+    // Sparkle: the Sunshine speckle texture, seen as ripple flecks around Link and as a glittering
+    // path toward the sun or moon that stays visible all the way to the horizon.
+    if u.eye.y >= world.y {
+        let lum_s = clamp(luminance(u.amb.rgb) * 1.4, 0.12, 1.0);
+        let rr = ripple_ring(world.xz, t);
+        let band = smoothstep(0.30, 0.95, 0.5 + 0.5 * sin(rr.y * 0.042 - t * 4.2));
+        let ring_sparkle = rr.x * band * speck_near(world.xz, t) * 1.6;
+        col = col + vec3f(0.92, 0.97, 1.0) * (0.35 + 0.65 * lum_s) * ring_sparkle;
+
+        let Rg = reflect(-V, N_low);
+        let along = max(dot(Rg, u.glint.xyz), 0.0);
+        let lobe = pow(along, 6.0) * 0.8 + pow(along, 40.0) * 1.0;
+        let flecks = speck_far(world.xz, dist, t);
+        let glitter = flecks * (0.06 + lobe * 3.2) * u.glint.w * clamp(u.sun2.w, 0.0, 2.0);
+        col = col + u.glint_col.rgb * glitter * (1.0 - 0.5 * clamp(fog, 0.0, 1.0));
+    }
 
     // Debug views: 1 = water mask, 2 = depth/thickness, 3 = normals.
     if u.screen.z > 0.5 {

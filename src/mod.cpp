@@ -442,6 +442,8 @@ struct Uniforms {
     float sun1[4];
     float sun2[4];
     float ripple[4];
+    float glint[4];
+    float glint_col[4];
 };
 static_assert(sizeof(Uniforms) % 16 == 0);
 
@@ -895,6 +897,38 @@ void fill_uniforms(Uniforms& uni, const CameraInfo& camera, uint32_t width, uint
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRefract, 100), 0, 400)) /
         100.0f;
     set4(uni.ripple, g_rippleIntensity, 0.0f, 0.0f, 0.0f);
+    {
+        // Glitter path: toward the sun while it is up, otherwise the moon.
+        auto direction = [&](const cXyz& p, float out[3]) {
+            float dx = p.x - camera.eye[0];
+            float dy = p.y - camera.eye[1];
+            float dz = p.z - camera.eye[2];
+            const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (len < 1.0f) {
+                out[0] = 0.0f;
+                out[1] = 1.0f;
+                out[2] = 0.0f;
+                return;
+            }
+            out[0] = dx / len;
+            out[1] = dy / len;
+            out[2] = dz / len;
+        };
+        float sd[3];
+        float md[3];
+        direction(env.sun_pos, sd);
+        direction(env.moon_pos, md);
+        if (sd[1] > 0.04f) {
+            set4(uni.glint, sd[0], sd[1], sd[2], std::clamp(sd[1] * 4.0f, 0.0f, 1.0f));
+            set4(uni.glint_col, 1.0f, 0.88f, 0.68f, 1.0f);
+        } else if (md[1] > 0.04f) {
+            set4(uni.glint, md[0], md[1], md[2], std::clamp(md[1] * 4.0f, 0.0f, 1.0f));
+            set4(uni.glint_col, 0.62f, 0.76f, 1.0f, 1.0f);
+        } else {
+            set4(uni.glint, 0.0f, 1.0f, 0.0f, 0.0f);
+            set4(uni.glint_col, 0.0f, 0.0f, 0.0f, 1.0f);
+        }
+    }
     set4(uni.sun2, refract, get_int_option(g_cvarMode, 1) == 1 ? 1.0f : 0.0f,
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarColor, 0), 0, 2)), overlay);
 }
