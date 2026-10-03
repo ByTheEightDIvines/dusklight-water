@@ -116,8 +116,16 @@ jobs:
       - name: Merge bundles
         run: |
           name=$(basename dist/mod-linux-x86_64/*.dusk)
+          set +e
           python3 tools/merge_mod.py -o "combined/$name" --symgen ./symgen \
-            dist/*/*.dusk
+            dist/*/*.dusk > merge.log 2>&1
+          status=$?
+          cat merge.log
+          if [ $status -ne 0 ]; then
+            msg=$(head -c 3500 merge.log | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=merge failed::$msg"
+            exit $status
+          fi
 
       - name: Upload combined bundle
         uses: actions/upload-artifact@v7
