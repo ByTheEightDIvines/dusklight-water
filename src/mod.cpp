@@ -753,7 +753,7 @@ void fill_uniforms(Uniforms& uni, const CameraInfo& camera, uint32_t width, uint
     const float refract =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRefract, 100), 0, 400)) /
         100.0f;
-    set4(uni.sun2, refract, 1.0f, 1.0f, overlay);
+    set4(uni.sun2, refract, get_int_option(g_cvarMode, 1) == 1 ? 1.0f : 0.0f, 1.0f, overlay);
 }
 
 // Game thread, after opaque scene draws and before translucent overlays (including stock water).
@@ -795,7 +795,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     g_frameCamera = camera;
     g_frameValid = true;
 
-    if (get_int_option(g_cvarMode, 0) != 1) {
+    if (get_int_option(g_cvarMode, 1) != 1) {
         return; // Sunshine mode draws from the before-HUD hook, after the stock water.
     }
 
@@ -848,7 +848,7 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
         return;
     }
     g_frameValid = false;
-    if (get_int_option(g_cvarMode, 0) == 1 || g_sunDrawType == 0) {
+    if (g_sunDrawType == 0) {
         return;
     }
 
@@ -887,7 +887,7 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
     payload.vertex_count = kSunCols * kSunRows * 6u;
     // Refraction wobble first (Sunshine's seaindirect layer), foam on top.
     payload.mode = 0;
-    if (get_int_option(g_cvarRefract, 100) > 0) {
+    if (get_int_option(g_cvarMode, 1) != 1 && get_int_option(g_cvarRefract, 100) > 0) {
         svc_gfx->push_draw(mod_ctx, g_sunDrawType, &payload, sizeof(payload));
     }
     payload.mode = 1;
@@ -950,13 +950,13 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     control.config_var = g_cvarEnabled;
     svc_ui->pane_add_control(mod_ctx, panel, &control, nullptr);
 
-    static const char* kModeOptions[] = {"Sunshine waves", "Custom surface"};
+    static const char* kModeOptions[] = {"Subtle overlay", "Rolling waves"};
     control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_SELECT;
     control.label = "Style";
-    control.help_rml = "Sunshine waves: the wave grid from Super Mario Sunshine drawn over the "
-                       "game's own water.<br/>Custom surface: an experimental replacement water "
-                       "surface with refraction and reflections.";
+    control.help_rml = "Subtle overlay: Sunshine's sparkle and wobble drawn over the game's own "
+                       "water.<br/>Rolling waves: a replacement water surface with visible "
+                       "swell, reflections and refraction, plus Sunshine's foam.";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_cvarMode;
     control.options = kModeOptions;
@@ -1010,7 +1010,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         register_int_option("clarity", 100, g_cvarClarity, error) != MOD_OK ||
         register_int_option("distanceHaze", 100, g_cvarFog, error) != MOD_OK ||
         register_int_option("debugView", 0, g_cvarDebug, error) != MOD_OK ||
-        register_int_option("style", 0, g_cvarMode, error) != MOD_OK ||
+        register_int_option("style", 1, g_cvarMode, error) != MOD_OK ||
         register_int_option("foamIntensity", 100, g_cvarOverlay, error) != MOD_OK ||
         register_int_option("refraction", 100, g_cvarRefract, error) != MOD_OK)
     {

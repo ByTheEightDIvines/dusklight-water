@@ -37,6 +37,7 @@ const WAVE_COUNT_VERTEX: i32 = 4;
 const WAVE_COUNT_FRAG: i32 = 8;
 const BASE_AMPLITUDE: f32 = 16.0;   // world units (1 unit is about 1 cm), scaled by params.y
 const BASE_WAVELENGTH: f32 = 900.0;
+const SWELL_SCALE: f32 = 0.9;       // fraction of Sunshine's swell amplitude used by the custom surface
 const SURFACE_LIFT: f32 = 2.0;      // keeps the surface just above the stock water plane
 
 struct VOut {
@@ -100,10 +101,24 @@ fn surface_info(xz: vec2f) -> vec4f {
 
 // Sum of sharp-crested waves, exp(sin - 1): always >= 0, so the surface never dips below the
 // stock water plane (which would let it show through). Returns (height, d/dx, d/dz).
+// Sunshine's two long rolling swells (TMapObjWave), shifted to be >= 0 so they only lift the
+// surface above the stock water plane. Returns (height, d/dx, d/dz).
+fn sun_swell(p: vec2f) -> vec3f {
+    let k1 = 0.02 / 6.28318;
+    let k2 = 0.03 / 6.28318;
+    let a1 = u.sun1.x * SWELL_SCALE;
+    let a2 = u.sun1.y * SWELL_SCALE;
+    let s1 = sin(k1 * p.x + u.sun0.z);
+    let s2 = sin(k2 * p.y + u.sun0.w);
+    return vec3f(a1 * (s1 + 1.0) + a2 * (s2 + 1.0),
+        a1 * k1 * cos(k1 * p.x + u.sun0.z), a2 * k2 * cos(k2 * p.y + u.sun0.w));
+}
+
 fn waves(p: vec2f, t: f32, count: i32, dist: f32) -> vec3f {
-    var h = 0.0;
-    var dx = 0.0;
-    var dz = 0.0;
+    let sw = sun_swell(p);
+    var h = sw.x;
+    var dx = sw.y;
+    var dz = sw.z;
     for (var i = 0; i < count; i = i + 1) {
         let fi = f32(i);
         let angle = 0.6 + fi * 2.399963;
@@ -335,7 +350,7 @@ fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> @locati
     let shore = (1.0 - smoothstep(4.0, 55.0, thick)) * smoothstep(0.0, 6.0, thick + 3.0);
     let band = 0.5 + 0.5 * sin(thick * 0.14 - t * 1.3 + fn1 * 6.0);
     var foam = shore * smoothstep(0.30, 0.70, fn1 * 0.6 + band * 0.55);
-    let crest = smoothstep(0.62, 0.95, w.x / (BASE_AMPLITUDE * 0.9)) * clamp(a_scale, 0.0, 1.0);
+    let crest = smoothstep(0.62, 0.95, (w.x - sun_swell(world.xz).x) / (BASE_AMPLITUDE * 0.9)) * clamp(a_scale, 0.0, 1.0);
     foam = foam + crest * smoothstep(0.45, 0.75, fn2) * 0.8;
     foam = clamp(foam, 0.0, 1.0);
     col = mix(col, vec3f(0.92, 0.96, 0.98) * (0.35 + 0.65 * lum), foam);
@@ -411,7 +426,12 @@ fn vs_sun(@builtin(vertex_index) vi: u32) -> SunOut {
     let a2 = u.sun1.y * amp;
     let h = a1 * sin(0.02 * (x * (1.0 / 6.28318)) + u.sun0.z)
           + a2 * sin(0.03 * (z * (1.0 / 6.28318)) + u.sun0.w);
-    let world = vec3f(x, info.x + h * u.params.y, z);
+    var world = vec3f(x, info.x + h * u.params.y, z);
+    if u.sun2.y > 0.5 {
+        // "Rolling waves" style: follow the opaque surface so the foam is not depth-culled by it.
+        let ws = waves(vec2f(x, z), u.params.x, 2, length(vec2f(xo, zo)));
+        world.y = info.x + SURFACE_LIFT + ws.x * amplitude_scale(info.z, info.y) + 14.0;
+    }
     o.pos = u.proj_from_world * vec4f(world, 1.0);
 
     // TMapObjWave::getAlpha, then the shore ramp (unk54).
