@@ -18,6 +18,8 @@ struct U {
     grid: vec4f,     // x origin, y origin, z step, w quads per side
     lat: vec4f,      // x ix0, y iz0, z width, w cell size
     screen: vec4f,   // x width, y height, z debug mode, w clarity
+    lat2: vec4f,     // coarse lattice: x ix0, y iz0, z width, w cell size
+    warp: vec4f,     // x linear step, y quadratic term of the grid radial warp, z fine radius
 }
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -37,24 +39,39 @@ struct VOut {
     @location(0) world: vec3f,
 }
 
-fn cell_at(i: i32, j: i32) -> vec4f {
+// Level 0 = fine lattice (near the camera), level 1 = coarse lattice (far reach). Both live in
+// one storage buffer: fine cells first, then coarse cells.
+fn use_fine(xz: vec2f) -> bool {
+    let d = max(abs(xz.x - u.eye.x), abs(xz.y - u.eye.z));
+    return d < u.warp.z;
+}
+
+fn cell_at(level: i32, i: i32, j: i32) -> vec4f {
     let w = i32(u.lat.z);
     if i < 0 || j < 0 || i >= w || j >= w {
         return vec4f(0.0);
     }
-    return lattice[u32(j * w + i)];
+    return lattice[u32(level * w * w + j * w + i)];
 }
 
 // Bilinear lattice query. Returns (height, depth, openness, anyWater)
 fn surface_info(xz: vec2f) -> vec4f {
-    let c = xz / u.lat.w - u.lat.xy - vec2f(0.5);
+    var level = 1;
+    var origin = u.lat2.xy;
+    var cell = u.lat2.w;
+    if use_fine(xz) {
+        level = 0;
+        origin = u.lat.xy;
+        cell = u.lat.w;
+    }
+    let c = xz / cell - origin - vec2f(0.5);
     let b = floor(c);
     let f = c - b;
     let bi = vec2i(b);
-    let s00 = cell_at(bi.x, bi.y);
-    let s10 = cell_at(bi.x + 1, bi.y);
-    let s01 = cell_at(bi.x, bi.y + 1);
-    let s11 = cell_at(bi.x + 1, bi.y + 1);
+    let s00 = cell_at(level, bi.x, bi.y);
+    let s10 = cell_at(level, bi.x + 1, bi.y);
+    let s01 = cell_at(level, bi.x, bi.y + 1);
+    let s11 = cell_at(level, bi.x + 1, bi.y + 1);
     let w00 = (1.0 - f.x) * (1.0 - f.y);
     let w10 = f.x * (1.0 - f.y);
     let w01 = (1.0 - f.x) * f.y;
@@ -78,7 +95,7 @@ fn surface_info(xz: vec2f) -> vec4f {
 
 // Sum of sharp-crested waves, exp(sin - 1): always >= 0, so the surface never dips below the
 // stock water plane (which would let it show through). Returns (height, d/dx, d/dz).
-fn waves(p: vec2f, t: f32, count: i32) -> vec3f {
+fn waves(p: vec2f, t: f32, count: i32, dist: f32) -> vec3f {
     var h = 0.0;
     var dx = 0.0;
     var dz = 0.0;
@@ -89,7 +106,9 @@ fn waves(p: vec2f, t: f32, count: i32) -> vec3f {
         let wl = BASE_WAVELENGTH * pow(0.55, fi);
         let k = 6.2831853 / wl;
         let omega = sqrt(980.0 * k) * 0.6;
-        let amp = BASE_AMPLITUDE * pow(0.62, fi);
+        // Short waves fade with distance: the mesh gets coarser and they would only alias.
+        let lod = 1.0 - smoothstep(wl * 5.0, wl * 25.0, dist);
+        let amp = BASE_AMPLITUDE * pow(0.62, fi) * lod;
         let th = k * dot(dir, p) - omega * t + fi * 1.7;
         let e = exp(sin(th) - 1.0);
         h = h + amp * e;
@@ -115,8 +134,11 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
     let gx = quad % n + cx[corner];
     let gz = quad / n + cz[corner];
     let half = f32(n) * 0.5;
-    let x = u.grid.x + (f32(gx) - half) * u.grid.z;
-    let z = u.grid.y + (f32(gz) - half) * u.grid.z;
+    let gu = f32(gx) - half;
+    let gv = f32(gz) - half;
+    // Dense near the camera, stretching toward the horizon.
+    let x = u.eye.x + sign(gu) * (u.warp.x * abs(gu) + u.warp.y * gu * gu);
+    let z = u.eye.z + sign(gv) * (u.warp.x * abs(gv) + u.warp.y * gv * gv);
 
     let info = surface_info(vec2f(x, z));
     if info.w < 1e-4 || info.z < 0.01 {
@@ -124,7 +146,8 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
         o.world = vec3f(0.0);
         return o;
     }
-    let w = waves(vec2f(x, z), u.params.x, WAVE_COUNT_VERTEX);
+    let vdist = length(vec2f(x - u.eye.x, z - u.eye.z));
+    let w = waves(vec2f(x, z), u.params.x, WAVE_COUNT_VERTEX, vdist);
     let y = info.x + SURFACE_LIFT + w.x * amplitude_scale(info.z, info.y);
     let world = vec3f(x, y, z);
     o.world = world;
@@ -211,8 +234,14 @@ fn reflect_ray(p: vec3f, r: vec3f, fallback: vec3f) -> vec3f {
 fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> @location(0) vec4f {
     let info = surface_info(world.xz);
     // Nearest-cell mask: only open water is replaced; stagnant cells keep the stock water.
-    let cell = vec2i(floor(world.xz / u.lat.w) - u.lat.xy);
-    let here = cell_at(cell.x, cell.y);
+    var here: vec4f;
+    if use_fine(world.xz) {
+        let cell = vec2i(floor(world.xz / u.lat.w) - u.lat.xy);
+        here = cell_at(0, cell.x, cell.y);
+    } else {
+        let cell = vec2i(floor(world.xz / u.lat2.w) - u.lat2.xy);
+        here = cell_at(1, cell.x, cell.y);
+    }
     if here.z < 1.5 {
         discard;
     }
@@ -223,7 +252,8 @@ fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> @locati
     let V = to_eye / dist;
 
     // Fade out toward the edge of the replaced region: dithered, because depth is written.
-    let edge_fade = smoothstep(0.80, 1.0, length(world.xz - eye.xz) / (u.grid.w * u.grid.z * 0.5));
+    let reach = u.lat2.z * u.lat2.w * 0.5;
+    let edge_fade = smoothstep(0.82, 1.0, length(world.xz - eye.xz) / reach);
     if edge_fade > hash21(frag.xy) {
         discard;
     }
@@ -233,12 +263,17 @@ fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> @locati
     let shallow = smoothstep(20.0, 260.0, info.y);
 
     // Normal: large waves + extra small octaves that only exist as shading.
-    let w = waves(world.xz, t, WAVE_COUNT_FRAG);
+    let w = waves(world.xz, t, WAVE_COUNT_FRAG, dist);
+    let w_low = waves(world.xz, t, 3, dist);
     let strength = u.params.z * mix(0.35, 1.0, shallow) * max(u.params.y, 0.15);
-    // Small ripples are always present, even if the big swell is turned down.
-    let ripple = vnoise(world.xz * 0.05 + vec2f(t * 0.4, -t * 0.3)) - 0.5;
-    let ripple2 = vnoise(world.xz * 0.11 - vec2f(t * 0.5, t * 0.2)) - 0.5;
-    var N = normalize(vec3f(-w.y * strength - ripple * 0.06, 1.0, -w.z * strength - ripple2 * 0.06));
+    // Small ripples are always present, even if the big swell is turned down, but fade out
+    // with distance so far water does not shimmer.
+    let ripple_fade = 1.0 - smoothstep(300.0, 2500.0, dist);
+    let ripple = (vnoise(world.xz * 0.05 + vec2f(t * 0.4, -t * 0.3)) - 0.5) * ripple_fade;
+    let ripple2 = (vnoise(world.xz * 0.11 - vec2f(t * 0.5, t * 0.2)) - 0.5) * ripple_fade;
+    // N: full detail (glint, refraction). N_low: smooth normal for reflections and Fresnel.
+    var N = normalize(vec3f(-w.y * strength - ripple * 0.05, 1.0, -w.z * strength - ripple2 * 0.05));
+    let N_low = normalize(vec3f(-w_low.y * strength, 1.0, -w_low.z * strength));
 
     let uv = frag.xy / u.screen.xy;
     let size = vec2i(u.screen.xy);
@@ -269,19 +304,20 @@ fn fs_main(@builtin(position) frag: vec4f, @location(0) world: vec3f) -> @locati
 
     // Absorption: red goes first, then green, blue lasts longest.
     let lum = clamp(luminance(u.amb.rgb) * 1.4, 0.12, 1.0);
-    let deep_col = vec3f(0.020, 0.115, 0.130) * lum + u.sky.rgb * 0.05;
+    let deep_col = (vec3f(0.050, 0.100, 0.085) + u.horizon.rgb * 0.10) * (0.35 + lum);
     let absorb = vec3f(0.0120, 0.0046, 0.0030) / max(u.screen.w, 0.1);
     let trans = exp(-absorb * thick);
     let body = under * trans + deep_col * (vec3f(1.0) - trans);
 
     // Reflection.
-    let cosv = clamp(dot(N, V), 0.0, 1.0);
+    let cosv = clamp(dot(N_low, V), 0.0, 1.0);
     let fres = 0.02 + 0.98 * pow(1.0 - cosv, 5.0);
+    let R_low = reflect(-V, N_low);
     let R = reflect(-V, N);
-    let sky = sky_color(vec3f(R.x, abs(R.y), R.z));
-    let refl = reflect_ray(world, R, sky);
+    let sky = sky_color(vec3f(R_low.x, abs(R_low.y), R_low.z));
+    let refl = reflect_ray(world, R_low, sky);
 
-    var col = mix(body, refl, clamp(fres * 1.15, 0.0, 0.95));
+    var col = mix(body, refl, clamp(fres * 0.85, 0.0, 0.85));
 
     // Sun glint.
     let sunv = u.sun.xyz;

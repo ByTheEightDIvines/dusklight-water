@@ -53,10 +53,14 @@ namespace {
 // ---------------------------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------------------------
-constexpr int kLatticeWidth = 64;       // lattice cells per side
-constexpr float kCellSize = 64.0f;      // world units per lattice cell (window = 4096 units)
-constexpr int kGridQuads = 256;         // surface grid quads per side (step = window / quads)
-constexpr int kProbeBudget = 256;       // collision probes per frame (window refreshed in 16 frames)
+constexpr int kLatticeWidth = 64;       // cells per side, both tiers
+constexpr float kFineCell = 64.0f;      // fine tier: window 4096 units (+-2048 around the camera)
+constexpr float kCoarseCell = 256.0f;   // coarse tier: window 16384 units (+-8192)
+constexpr int kFineBudget = 256;        // collision probes per frame (fine window: 16 frames)
+constexpr int kCoarseBudget = 128;      // collision probes per frame (coarse window: 32 frames)
+constexpr float kFineRadius = 1850.0f;  // the shader uses the fine tier within this distance
+constexpr int kGridQuads = 256;         // surface grid quads per side
+constexpr float kGridStep = 16.0f;      // grid spacing at the camera; widens toward the horizon
 constexpr float kPuddleMaxDepth = 60.0f;   // patches never deeper than this are stagnant...
 constexpr int kPuddleMinCells = 6;         // ...and so are patches smaller than this many cells
 constexpr float kSameBodyHeightTol = 30.0f; // neighbours within this height difference are one body
@@ -80,7 +84,11 @@ bool g_warnedNoResolve = false;
 bool g_loggedFirstDraw = false;
 
 // ---------------------------------------------------------------------------------------------
-// Water lattice (game thread only)
+// Water lattices (game thread only)
+//
+// Two world-aligned tiers are kept around the camera: a fine one for detail near the player and
+// a coarse one for reach. The shader uses the fine tier close to the camera and the coarse tier
+// beyond it.
 // ---------------------------------------------------------------------------------------------
 struct Cell {
     int ix = INT32_MIN;
@@ -90,9 +98,19 @@ struct Cell {
     bool found = false;
 };
 
-std::array<Cell, kLatticeWidth * kLatticeWidth> g_cache;
-std::array<std::array<float, 4>, kLatticeWidth * kLatticeWidth> g_snapshot;
-unsigned g_cursor = 0;
+struct Lattice {
+    float cellSize = 64.0f;
+    int budget = 256;
+    std::array<Cell, kLatticeWidth * kLatticeWidth> cache;
+    unsigned cursor = 0;
+    int ix0 = 0;
+    int iz0 = 0;
+};
+
+Lattice g_fine{kFineCell, kFineBudget, {}, 0, 0, 0};
+Lattice g_coarse{kCoarseCell, kCoarseBudget, {}, 0, 0, 0};
+// Fine tier then coarse tier, uploaded as one storage buffer.
+std::array<std::array<float, 4>, 2 * kLatticeWidth * kLatticeWidth> g_snapshot;
 float g_lastWaterY = 0.0f;
 bool g_haveLastWaterY = false;
 
@@ -100,8 +118,8 @@ int wrap_index(int v) {
     return ((v % kLatticeWidth) + kLatticeWidth) % kLatticeWidth;
 }
 
-Cell& cache_at(int ix, int iz) {
-    return g_cache[wrap_index(iz) * kLatticeWidth + wrap_index(ix)];
+Cell& cache_at(Lattice& lat, int ix, int iz) {
+    return lat.cache[wrap_index(iz) * kLatticeWidth + wrap_index(ix)];
 }
 
 // Same query the game uses (fopAcM_wt_c::waterCheck) but with our own check object so the game's
@@ -131,13 +149,13 @@ float probe_depth(float x, float waterY, float z) {
     return std::max(waterY - groundY, 0.0f);
 }
 
-void probe_cell(int ix, int iz, float playerY, float eyeY) {
-    Cell& cell = cache_at(ix, iz);
+void probe_cell(Lattice& lat, int ix, int iz, float playerY, float eyeY) {
+    Cell& cell = cache_at(lat, ix, iz);
     cell.ix = ix;
     cell.iz = iz;
     cell.found = false;
-    const float x = (static_cast<float>(ix) + 0.5f) * kCellSize;
-    const float z = (static_cast<float>(iz) + 0.5f) * kCellSize;
+    const float x = (static_cast<float>(ix) + 0.5f) * lat.cellSize;
+    const float z = (static_cast<float>(iz) + 0.5f) * lat.cellSize;
 
     float candidates[3] = {g_lastWaterY, playerY, eyeY};
     const int count = g_haveLastWaterY ? 3 : 2;
@@ -155,17 +173,18 @@ void probe_cell(int ix, int iz, float playerY, float eyeY) {
     }
 }
 
-// Builds the snapshot sent to the GPU: .x height, .y depth, .z state (0 none, 1 stagnant, 2 open).
-void build_snapshot(int ix0, int iz0) {
+// Writes one tier into `out` (kLatticeWidth^2 entries): .x height, .y depth, .z state
+// (0 none, 1 stagnant, 2 open). Returns true if any cell is open water.
+bool build_snapshot(Lattice& lat, std::array<float, 4>* out) {
     constexpr int W = kLatticeWidth;
     std::array<uint8_t, W * W> state{};
     std::array<float, W * W> height{};
     std::array<float, W * W> depth{};
     for (int j = 0; j < W; ++j) {
         for (int i = 0; i < W; ++i) {
-            const Cell& c = cache_at(ix0 + i, iz0 + j);
+            const Cell& c = cache_at(lat, lat.ix0 + i, lat.iz0 + j);
             const int idx = j * W + i;
-            if (c.ix == ix0 + i && c.iz == iz0 + j && c.found) {
+            if (c.ix == lat.ix0 + i && c.iz == lat.iz0 + j && c.found) {
                 state[idx] = 1;
                 height[idx] = c.height;
                 depth[idx] = c.depth;
@@ -177,6 +196,7 @@ void build_snapshot(int ix0, int iz0) {
     std::array<uint8_t, W * W> visited{};
     std::vector<int> stack;
     std::vector<int> members;
+    bool anyOpen = false;
     for (int start = 0; start < W * W; ++start) {
         if (state[start] == 0 || visited[start]) {
             continue;
@@ -218,14 +238,29 @@ void build_snapshot(int ix0, int iz0) {
         const bool open = touchesEdge ||
                           (maxDepth >= kPuddleMaxDepth &&
                               static_cast<int>(members.size()) >= kPuddleMinCells);
+        anyOpen = anyOpen || open;
         for (int m : members) {
             state[m] = open ? 2 : 1;
         }
     }
 
     for (int idx = 0; idx < W * W; ++idx) {
-        g_snapshot[idx] = {height[idx], depth[idx], static_cast<float>(state[idx]), 0.0f};
+        out[idx] = {height[idx], depth[idx], static_cast<float>(state[idx]), 0.0f};
     }
+    return anyOpen;
+}
+
+// Probes a slice of the tier around the camera, then refreshes its snapshot.
+bool update_lattice(Lattice& lat, std::array<float, 4>* out, const CameraInfo& camera,
+    float playerY) {
+    lat.ix0 = static_cast<int>(std::floor(camera.eye[0] / lat.cellSize)) - kLatticeWidth / 2;
+    lat.iz0 = static_cast<int>(std::floor(camera.eye[2] / lat.cellSize)) - kLatticeWidth / 2;
+    for (int n = 0; n < lat.budget; ++n) {
+        const unsigned idx = lat.cursor++ % (kLatticeWidth * kLatticeWidth);
+        probe_cell(lat, lat.ix0 + static_cast<int>(idx % kLatticeWidth),
+            lat.iz0 + static_cast<int>(idx / kLatticeWidth), playerY, camera.eye[1]);
+    }
+    return build_snapshot(lat, out);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -243,6 +278,8 @@ struct Uniforms {
     float grid[4];
     float lat[4];
     float screen[4];
+    float lat2[4];
+    float warp[4];
 };
 static_assert(sizeof(Uniforms) % 16 == 0);
 
@@ -421,29 +458,15 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         return;
     }
 
-    // Lattice window around the camera, refreshed a slice per frame.
-    const int ix0 = static_cast<int>(std::floor(camera.eye[0] / kCellSize)) - kLatticeWidth / 2;
-    const int iz0 = static_cast<int>(std::floor(camera.eye[2] / kCellSize)) - kLatticeWidth / 2;
     float playerY = camera.eye[1];
     if (fopAc_ac_c* player = dComIfGp_getPlayer(0)) {
         playerY = player->current.pos.y;
     }
-    for (int n = 0; n < kProbeBudget; ++n) {
-        const unsigned idx = g_cursor++ % (kLatticeWidth * kLatticeWidth);
-        probe_cell(ix0 + static_cast<int>(idx % kLatticeWidth),
-            iz0 + static_cast<int>(idx / kLatticeWidth), playerY, camera.eye[1]);
-    }
-    build_snapshot(ix0, iz0);
-
+    const bool fineOpen = update_lattice(g_fine, g_snapshot.data(), camera, playerY);
+    const bool coarseOpen = update_lattice(
+        g_coarse, g_snapshot.data() + kLatticeWidth * kLatticeWidth, camera, playerY);
     // Nothing open nearby: skip the draw entirely.
-    bool anyOpen = false;
-    for (const auto& s : g_snapshot) {
-        if (s[2] > 1.5f) {
-            anyOpen = true;
-            break;
-        }
-    }
-    if (!anyOpen) {
+    if (!fineOpen && !coarseOpen) {
         return;
     }
 
@@ -463,8 +486,6 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
 
     static const auto kStart = std::chrono::steady_clock::now();
     const float time = std::chrono::duration<float>(std::chrono::steady_clock::now() - kStart).count();
-
-    const float step = (static_cast<float>(kLatticeWidth) * kCellSize) / kGridQuads;
 
     Uniforms uni{};
     std::memcpy(uni.proj_from_world, camera.proj_from_world, sizeof(uni.proj_from_world));
@@ -503,12 +524,17 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const float fog =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarFog, 100), 0, 1000)) /
         100.0f * 1.5e-5f;
-    set4(uni.params, time, waveHeight, normals * 6.0f, fog);
-    // Grid is snapped to the step so vertices do not swim as the camera moves.
-    set4(uni.grid, std::floor(camera.eye[0] / step) * step, std::floor(camera.eye[2] / step) * step,
-        step, static_cast<float>(kGridQuads));
-    set4(uni.lat, static_cast<float>(ix0), static_cast<float>(iz0),
-        static_cast<float>(kLatticeWidth), kCellSize);
+    set4(uni.params, time, waveHeight, normals * 3.0f, fog);
+    set4(uni.grid, 0.0f, 0.0f, kGridStep, static_cast<float>(kGridQuads));
+    set4(uni.lat, static_cast<float>(g_fine.ix0), static_cast<float>(g_fine.iz0),
+        static_cast<float>(kLatticeWidth), kFineCell);
+    set4(uni.lat2, static_cast<float>(g_coarse.ix0), static_cast<float>(g_coarse.iz0),
+        static_cast<float>(kLatticeWidth), kCoarseCell);
+    // Radial grid warp: offset = a*|g| + b*g^2 so the outermost vertex reaches the coarse extent.
+    const float half = static_cast<float>(kGridQuads) * 0.5f;
+    const float reach = static_cast<float>(kLatticeWidth) * kCoarseCell * 0.5f;
+    const float warpB = (reach - kGridStep * half) / (half * half);
+    set4(uni.warp, kGridStep, warpB, kFineRadius, 0.0f);
     set4(uni.screen, static_cast<float>(resolved.width), static_cast<float>(resolved.height),
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarDebug, 0), 0, 3)), clarity);
 
