@@ -48,7 +48,6 @@
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
-#include <aurora/dl.hpp>
 
 DEFINE_MOD();
 IMPORT_SERVICE(LogService, svc_log);
@@ -539,48 +538,117 @@ int water_role(const char* nm) {
     return nm[6] == '9' ? 3 : 2;
 }
 
+// Minimal GX display-list reader (draw commands only). The water shapes carry nothing else.
+// Vertex attributes are one byte (direct matrix indices, INDEX8) or two (INDEX16), big-endian.
+unsigned g_dlUnsupported = 0;
+
 void extract_shape_tris(J3DModelData* md, J3DShape* sh, std::vector<WTri>& out) {
     J3DVertexData* vd = &md->getVertexData();
     const u8* pos = static_cast<const u8*>(vd->getVtxPosArray());
-    if (pos == nullptr || sh == nullptr) {
+    if (pos == nullptr || sh == nullptr || sh->getVtxDesc() == nullptr) {
         return;
     }
     const int ptype = vd->getVtxPosType();
     const float frac = 1.0f / static_cast<float>(1 << vd->getVtxPosFrac());
+    // Vertex layout: attributes in descriptor order.
+    unsigned stride = 0;
+    unsigned posOff = 0;
+    bool posIndex16 = false;
+    bool havePos = false;
+    for (const GXVtxDescList* d = sh->getVtxDesc(); d->attr != GX_VA_NULL; ++d) {
+        static const unsigned kSize[] = {0, 1, 1, 2};
+        if (d->type > GX_INDEX16) {
+            return;
+        }
+        if (d->attr == GX_VA_POS) {
+            havePos = true;
+            posOff = stride;
+            posIndex16 = d->type == GX_INDEX16;
+            if (d->type == GX_DIRECT) {
+                return; // direct positions are not used by stage water
+            }
+        }
+        stride += kSize[d->type];
+    }
+    if (!havePos || stride == 0) {
+        return;
+    }
+    auto vertex = [&](const u8* v) {
+        const u32 ix = posIndex16 ? (static_cast<u32>(v[posOff]) << 8 | v[posOff + 1]) : v[posOff];
+        V3 o;
+        if (ptype == GX_F32) {
+            float f[3];
+            std::memcpy(f, pos + ix * 12, 12);
+            o = {f[0], f[1], f[2]};
+        } else {
+            s16 f[3];
+            std::memcpy(f, pos + ix * 6, 6);
+            o = {f[0] * frac, f[1] * frac, f[2] * frac};
+        }
+        return o;
+    };
     const unsigned groups = sh->getMtxGroupNum();
     for (unsigned g = 0; g < groups; ++g) {
         J3DShapeDraw* d = sh->getShapeDraw(g);
         if (d == nullptr || d->getDisplayList() == nullptr) {
             continue;
         }
-        aurora::gx::dl::Reader rd(
-            reinterpret_cast<const u8*>(d->getDisplayList()), d->getDisplayListSize(),
-            sh->getVtxDesc());
-        while (auto c = rd.next()) {
-            if (c->kind != aurora::gx::dl::Command::Kind::Draw) {
+        const u8* dl = reinterpret_cast<const u8*>(d->getDisplayList());
+        const u32 size = d->getDisplayListSize();
+        u32 r = 0;
+        std::vector<V3> pts;
+        while (r < size) {
+            const u8 op = dl[r];
+            if (op == 0) {
+                ++r;
                 continue;
             }
-            auto P = [&](u32 v) {
-                const u32 ix = c->draw.attr_idx(v, GX_VA_POS);
-                V3 o;
-                if (ptype == GX_F32) {
-                    const float* f = reinterpret_cast<const float*>(pos + ix * 12);
-                    o = {f[0], f[1], f[2]};
-                } else {
-                    const s16* f = reinterpret_cast<const s16*>(pos + ix * 6);
-                    o = {f[0] * frac, f[1] * frac, f[2] * frac};
+            const u8 prim = op & 0xF8;
+            if (prim != 0x80 && prim != 0x90 && prim != 0x98 && prim != 0xA0) {
+                ++g_dlUnsupported;
+                break; // anything else (state loads, other primitives): stop reading this list
+            }
+            if (r + 3 > size) {
+                break;
+            }
+            const u32 n = static_cast<u32>(dl[r + 1]) << 8 | dl[r + 2];
+            r += 3;
+            if (r + n * stride > size) {
+                break;
+            }
+            pts.clear();
+            for (u32 k = 0; k < n; ++k) {
+                pts.push_back(vertex(dl + r + k * stride));
+            }
+            r += n * stride;
+            auto emit = [&](const V3& a, const V3& b, const V3& c) {
+                const float ar = std::fabs((b.x - a.x) * (c.z - a.z) - (b.z - a.z) * (c.x - a.x));
+                if (ar > 1e-3f) {
+                    out.push_back({{a, b, c}});
                 }
-                return o;
             };
-            aurora::gx::dl::expand_triangles(c->draw.prim, c->draw.vtxCount,
-                [&](u16 a, u16 b, u16 cc) {
-                    WTri t{{P(a), P(b), P(cc)}};
-                    const float ar = std::fabs((t.p[1].x - t.p[0].x) * (t.p[2].z - t.p[0].z) -
-                                               (t.p[1].z - t.p[0].z) * (t.p[2].x - t.p[0].x));
-                    if (ar > 1e-3f) {
-                        out.push_back(t);
+            if (prim == 0x90) {
+                for (u32 i = 0; i + 2 < n; i += 3) {
+                    emit(pts[i], pts[i + 1], pts[i + 2]);
+                }
+            } else if (prim == 0x98) {
+                for (u32 i = 2; i < n; ++i) {
+                    if (i & 1) {
+                        emit(pts[i - 1], pts[i - 2], pts[i]);
+                    } else {
+                        emit(pts[i - 2], pts[i - 1], pts[i]);
                     }
-                });
+                }
+            } else if (prim == 0xA0) {
+                for (u32 i = 2; i < n; ++i) {
+                    emit(pts[0], pts[i - 1], pts[i]);
+                }
+            } else {
+                for (u32 i = 0; i + 3 < n; i += 4) {
+                    emit(pts[i], pts[i + 1], pts[i + 2]);
+                    emit(pts[i + 2], pts[i + 3], pts[i]);
+                }
+            }
         }
     }
 }
@@ -635,8 +703,8 @@ void scan_model(J3DModelData* md, LocalWater& lw) {
         }
     }
     char line[200];
-    std::snprintf(line, sizeof(line), "water model %p: %zu layers hidden, %zu triangles", (void*)md,
-        lw.hide.size(), lw.tris.size());
+    std::snprintf(line, sizeof(line), "water model %p: %zu layers hidden, %zu triangles%s", (void*)md,
+        lw.hide.size(), lw.tris.size(), g_dlUnsupported ? " (some display lists unsupported)" : "");
     svc_log->info(mod_ctx, line);
 }
 
