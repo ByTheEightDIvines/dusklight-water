@@ -46,6 +46,8 @@
 #include "JSystem/J3DGraphBase/J3DShapeDraw.h"
 #include "JSystem/JUtility/JUTNameTab.h"
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <aurora/dl.hpp>
 
 DEFINE_MOD();
@@ -460,115 +462,633 @@ bool cpu_surface_info(float x, float z, float& openness, float& depth) {
 }
 
 
-// ---- Stage water material scan (diagnostic only; logs, never changes drawing) ----
+// ---------------------------------------------------------------------------------------------
+// Stage water capture
+//
+// dKy_bg_MAxx_proc runs every frame for every stage / actor model that carries water materials. A
+// post-hook picks out the stock water layers by material name (MA06 murky base, MA09 shimmering
+// top), hides those shapes, and remembers their triangles so we can draw our own water on exactly
+// the same surface.
+// ---------------------------------------------------------------------------------------------
 DEFINE_HOOK(&dKy_bg_MAxx_proc, BgMaxxProc);
 
+struct V3 {
+    float x, y, z;
+};
+struct WTri {
+    V3 p[3];
+};
+
+struct LocalWater {
+    const void* names = nullptr;
+    const void* posArray = nullptr;
+    unsigned matNum = 0;
+    unsigned gen = 0;
+    std::vector<J3DShape*> hide; // every stock water layer shape in this model
+    std::vector<WTri> tris;      // drawable layers, model space, MA06 duplicates of MA09 removed
+};
+std::unordered_map<const void*, LocalWater> g_localWater;
+unsigned g_genCounter = 0;
+
+struct Instance {
+    const void* md;
+    float mtx[12];
+    float scale[3];
+};
+std::vector<Instance> g_instances;
+
+bool starts_with(const char* s, const char* prefix) {
+    return s != nullptr && std::strncmp(s, prefix, std::strlen(prefix)) == 0;
+}
+
+// Dungeons keep their stock water, except the Morpheel arena.
+bool stage_uses_water_mesh() {
+    const char* stage = dComIfGp_getStartStageName();
+    if (stage == nullptr) {
+        return true;
+    }
+    if (starts_with(stage, "D_MN01B")) {
+        return true;
+    }
+    return !starts_with(stage, "D_");
+}
+
+bool in_morpheel_arena() {
+    return starts_with(dComIfGp_getStartStageName(), "D_MN01B");
+}
+
+// Layer role from the material name: 0 = not water, 1 = hidden only (shore / wave strips),
+// 2 = drawable base layer (MA06), 3 = drawable top layer (MA09).
+int water_role(const char* nm) {
+    if (nm == nullptr || std::strlen(nm) < 8 || nm[3] != 'M' || nm[4] != 'A' || nm[5] != '0') {
+        return 0;
+    }
+    if (nm[6] != '6' && nm[6] != '9') {
+        return 0;
+    }
+    static const char* const kNot[] = {"Taki", "aki", "plash", "unsui", "awa", "Oil", "Kasan",
+        "Sunbeam", "wall", "Jyozan"};
+    for (const char* bad : kNot) {
+        if (std::strstr(nm, bad) != nullptr) {
+            return 0;
+        }
+    }
+    if (std::strstr(nm, "giwa") != nullptr || std::strstr(nm, "nami") != nullptr) {
+        return 1;
+    }
+    return nm[6] == '9' ? 3 : 2;
+}
+
+void extract_shape_tris(J3DModelData* md, J3DShape* sh, std::vector<WTri>& out) {
+    J3DVertexData* vd = &md->getVertexData();
+    const u8* pos = static_cast<const u8*>(vd->getVtxPosArray());
+    if (pos == nullptr || sh == nullptr) {
+        return;
+    }
+    const int ptype = vd->getVtxPosType();
+    const float frac = 1.0f / static_cast<float>(1 << vd->getVtxPosFrac());
+    const unsigned groups = sh->getMtxGroupNum();
+    for (unsigned g = 0; g < groups; ++g) {
+        J3DShapeDraw* d = sh->getShapeDraw(g);
+        if (d == nullptr || d->getDisplayList() == nullptr) {
+            continue;
+        }
+        aurora::gx::dl::Reader rd(
+            reinterpret_cast<const u8*>(d->getDisplayList()), d->getDisplayListSize(),
+            sh->getVtxDesc());
+        while (auto c = rd.next()) {
+            if (c->kind != aurora::gx::dl::Command::Kind::Draw) {
+                continue;
+            }
+            auto P = [&](u32 v) {
+                const u32 ix = c->draw.attr_idx(v, GX_VA_POS);
+                V3 o;
+                if (ptype == GX_F32) {
+                    const float* f = reinterpret_cast<const float*>(pos + ix * 12);
+                    o = {f[0], f[1], f[2]};
+                } else {
+                    const s16* f = reinterpret_cast<const s16*>(pos + ix * 6);
+                    o = {f[0] * frac, f[1] * frac, f[2] * frac};
+                }
+                return o;
+            };
+            aurora::gx::dl::expand_triangles(c->draw.prim, c->draw.vtxCount,
+                [&](u16 a, u16 b, u16 cc) {
+                    WTri t{{P(a), P(b), P(cc)}};
+                    const float ar = std::fabs((t.p[1].x - t.p[0].x) * (t.p[2].z - t.p[0].z) -
+                                               (t.p[1].z - t.p[0].z) * (t.p[2].x - t.p[0].x));
+                    if (ar > 1e-3f) {
+                        out.push_back(t);
+                    }
+                });
+        }
+    }
+}
+
+int64_t centroid_key(const WTri& t) {
+    const int64_t cx = std::llround((t.p[0].x + t.p[1].x + t.p[2].x) / 3.0f);
+    const int64_t cz = std::llround((t.p[0].z + t.p[1].z + t.p[2].z) / 3.0f);
+    return (cx << 32) ^ (cz & 0xFFFFFFFF);
+}
+
+void scan_model(J3DModelData* md, LocalWater& lw) {
+    lw.names = md->getMaterialName();
+    lw.posArray = md->getVertexData().getVtxPosArray();
+    lw.matNum = md->getMaterialNum();
+    lw.gen = ++g_genCounter;
+    lw.hide.clear();
+    lw.tris.clear();
+    if (!stage_uses_water_mesh()) {
+        return;
+    }
+    JUTNameTab* names = md->getMaterialName();
+    if (names == nullptr) {
+        return;
+    }
+    std::vector<WTri> top;
+    std::vector<WTri> base;
+    for (u16 i = 0; i < lw.matNum; ++i) {
+        const int role = water_role(names->getName(i));
+        if (role == 0) {
+            continue;
+        }
+        J3DMaterial* mat = md->getMaterialNodePointer(i);
+        J3DShape* sh = mat != nullptr ? mat->getShape() : nullptr;
+        if (sh == nullptr) {
+            continue;
+        }
+        lw.hide.push_back(sh);
+        if (role == 3) {
+            extract_shape_tris(md, sh, top);
+        } else if (role == 2) {
+            extract_shape_tris(md, sh, base);
+        }
+    }
+    std::unordered_set<int64_t> have;
+    for (const WTri& t : top) {
+        have.insert(centroid_key(t));
+        lw.tris.push_back(t);
+    }
+    for (const WTri& t : base) {
+        if (have.find(centroid_key(t)) == have.end()) {
+            lw.tris.push_back(t);
+        }
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "water model %p: %zu layers hidden, %zu triangles", (void*)md,
+        lw.hide.size(), lw.tris.size());
+    svc_log->info(mod_ctx, line);
+}
+
 void on_bg_maxx_post(ModContext*, void* args, void*, void*) {
-    static std::set<const void*> seen;
+    if (!get_bool_option(g_cvarEnabled, true)) {
+        return;
+    }
     J3DModel* model = mods::arg<J3DModel*>(args, 0);
     if (model == nullptr) {
         return;
     }
     J3DModelData* md = model->getModelData();
-    if (md == nullptr || !seen.insert(md).second) {
+    if (md == nullptr) {
         return;
     }
-    JUTNameTab* names = md->getMaterialName();
-    const u16 n = md->getMaterialNum();
-    char line[320];
-    snprintf(line, sizeof(line), "[waterscan] model %p: %u materials, %u shapes", (void*)md,
-        (unsigned)n, (unsigned)md->getShapeNum());
-    svc_log->info(mod_ctx, line);
-    for (u16 i = 0; i < n && names != nullptr; ++i) {
-        const char* nm = names->getName(i);
-        if (nm == nullptr || strlen(nm) < 8) {
-            continue;
-        }
-        const bool ma = nm[3] == 'M' && nm[4] == 'A';
-        const bool wordy = strstr(nm, "ater") || strstr(nm, "aki") || strstr(nm, "unsui") ||
-                           strstr(nm, "izu") || strstr(nm, "uisou");
-        if (!ma && !wordy) {
-            continue;
-        }
-        if (ma && !(nm[5] == '0' && (nm[6] == '1' || nm[6] == '2' || nm[6] == '3' || nm[6] == '6' || nm[6] == '9')) && !wordy) {
-            continue;
-        }
-        J3DMaterial* mat = md->getMaterialNodePointer(i);
-        J3DShape* sh = mat != nullptr ? mat->getShape() : nullptr;
-        unsigned groups = 0, dlBytes = 0, flags = 0;
-        if (sh != nullptr) {
-            groups = sh->getMtxGroupNum();
-            for (u16 g = 0; g < groups; ++g) {
-                J3DShapeDraw* d = sh->getShapeDraw(g);
-                if (d != nullptr) {
-                    dlBytes += d->getDisplayListSize();
-                }
-            }
-            flags = 0;
-        }
-        if (sh != nullptr) {
-            J3DVertexData* vd = &md->getVertexData();
-            const u8* pos = (const u8*)vd->getVtxPosArray();
-            const int ptype = vd->getVtxPosType();
-            const u8 pfrac = vd->getVtxPosFrac();
-            unsigned tris = 0, bad = 0;
-            float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
-            float minArea = 1e30f, maxArea = 0.0f;
-            for (u16 g = 0; g < groups && pos != nullptr; ++g) {
-                J3DShapeDraw* d = sh->getShapeDraw(g);
-                if (d == nullptr || d->getDisplayList() == nullptr) {
-                    continue;
-                }
-                aurora::gx::dl::Reader rd((const u8*)d->getDisplayList(), d->getDisplayListSize(), sh->getVtxDesc());
-                while (auto c = rd.next()) {
-                    if (c->kind != aurora::gx::dl::Command::Kind::Draw) {
-                        continue;
-                    }
-                    auto P = [&](u32 v, float* o) {
-                        const u32 ix = c->draw.attr_idx(v, GX_VA_POS);
-                        if (ptype == GX_F32) {
-                            const float* f = (const float*)(pos + ix * 12);
-                            o[0] = f[0]; o[1] = f[1]; o[2] = f[2];
-                        } else {
-                            const s16* f = (const s16*)(pos + ix * 6);
-                            const float sc = 1.0f / (float)(1 << pfrac);
-                            o[0] = f[0] * sc; o[1] = f[1] * sc; o[2] = f[2] * sc;
-                        }
-                        for (int k = 0; k < 3; ++k) { mn[k] = std::min(mn[k], o[k]); mx[k] = std::max(mx[k], o[k]); }
-                    };
-                    const bool ok = aurora::gx::dl::expand_triangles(c->draw.prim, c->draw.vtxCount,
-                        [&](u16 a, u16 b, u16 cc) {
-                            float A[3], B[3], C[3];
-                            P(a, A); P(b, B); P(cc, C);
-                            const float ux = B[0]-A[0], uz = B[2]-A[2], vx = C[0]-A[0], vz = C[2]-A[2];
-                            const float ar = fabsf(ux * vz - uz * vx) * 0.5f;
-                            minArea = std::min(minArea, ar); maxArea = std::max(maxArea, ar);
-                            ++tris;
-                        });
-                    if (!ok) ++bad;
-                }
-                if (rd.failed()) ++bad;
-            }
-            snprintf(line, sizeof(line),
-                "[waterscan]     tris=%u bad=%u posType=%d frac=%u Y[%.1f..%.1f] X[%.0f..%.0f] Z[%.0f..%.0f] area[%.0f..%.0f]",
-                tris, bad, ptype, (unsigned)pfrac, mn[1], mx[1], mn[0], mx[0], mn[2], mx[2], minArea, maxArea);
-            svc_log->info(mod_ctx, line);
-        }
-        snprintf(line, sizeof(line), "[waterscan]   mat %u '%s' shape=%p groups=%u dl=%uB flag=%u", (unsigned)i, nm,
-            (void*)sh, groups, dlBytes, flags);
-        svc_log->info(mod_ctx, line);
+    LocalWater& lw = g_localWater[md];
+    if (lw.gen == 0 || lw.names != static_cast<const void*>(md->getMaterialName()) ||
+        lw.matNum != md->getMaterialNum() ||
+        lw.posArray != md->getVertexData().getVtxPosArray())
+    {
+        scan_model(md, lw);
     }
+    if (lw.hide.empty()) {
+        return;
+    }
+    for (J3DShape* sh : lw.hide) {
+        sh->hide();
+    }
+    if (lw.tris.empty()) {
+        return;
+    }
+    Instance inst{};
+    inst.md = md;
+    MtxP m = model->getBaseTRMtx();
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            inst.mtx[r * 4 + c] = m[r][c];
+        }
+    }
+    const Vec* s = model->getBaseScale();
+    inst.scale[0] = s->x;
+    inst.scale[1] = s->y;
+    inst.scale[2] = s->z;
+    for (const Instance& other : g_instances) {
+        if (other.md == inst.md && std::memcmp(other.mtx, inst.mtx, sizeof(inst.mtx)) == 0) {
+            return;
+        }
+    }
+    g_instances.push_back(inst);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Water bodies: connected pieces of the captured surface, each with its own style.
+// ---------------------------------------------------------------------------------------------
+enum BodyStyle { STYLE_OPEN = 0, STYLE_STILL = 1, STYLE_FLAT = 2, STYLE_FLOWING = 3 };
+
+constexpr float kOpenMinArea = 1.2e6f;     // smaller bodies never get waves
+constexpr float kOpenMinDepth = 120.0f;    // nor do shallow ones
+constexpr float kWaveEdgeNear = 60.0f;     // waves fade out toward the shore over this range...
+constexpr float kWaveEdgeFar = 600.0f;
+constexpr size_t kMaxFrameVerts = 200000;
+constexpr size_t kMaxBodyTris = 40000;
+
+struct Seg {
+    float ax, az, bx, bz;
+};
+
+struct BodyMesh {
+    std::vector<WTri> tris; // base triangles, world space
+    float area = 0.0f;
+    float ymin = 1e30f, ymax = -1e30f;
+    float x0 = 1e30f, z0 = 1e30f, x1 = -1e30f, z1 = -1e30f;
+    int style = -1;
+    bool built = false;
+    std::vector<float> verts; // x y z w, 4 floats per vertex; w = style * 8 + wave amplitude
+    std::vector<Seg> segs;    // shoreline: base-mesh edges used by one triangle only
+    std::unordered_map<int64_t, std::vector<int>> segGrid;
+    int deferred = 0;
+};
+
+constexpr float kSegCell = 800.0f;
+
+int64_t cell_key(int ix, int iz) {
+    return (static_cast<int64_t>(ix) << 32) ^ static_cast<int64_t>(static_cast<uint32_t>(iz));
+}
+
+float boundary_dist(const BodyMesh& b, float x, float z) {
+    auto it = b.segGrid.find(cell_key(static_cast<int>(std::floor(x / kSegCell)),
+        static_cast<int>(std::floor(z / kSegCell))));
+    if (it == b.segGrid.end()) {
+        return 1e9f;
+    }
+    float best = 1e18f;
+    for (int si : it->second) {
+        const Seg& s = b.segs[si];
+        const float dx = s.bx - s.ax;
+        const float dz = s.bz - s.az;
+        const float len2 = dx * dx + dz * dz;
+        float t = len2 > 1e-6f ? ((x - s.ax) * dx + (z - s.az) * dz) / len2 : 0.0f;
+        t = std::clamp(t, 0.0f, 1.0f);
+        const float px = s.ax + dx * t - x;
+        const float pz = s.az + dz * t - z;
+        best = std::min(best, px * px + pz * pz);
+    }
+    return std::sqrt(best);
+}
+
+float wave_amp_at(const BodyMesh& b, float x, float z) {
+    if (b.style != STYLE_OPEN) {
+        return 0.0f;
+    }
+    return smoothstep_f(kWaveEdgeNear, kWaveEdgeFar, boundary_dist(b, x, z));
+}
+
+int64_t vert_key(const V3& v) {
+    const int64_t ix = std::llround(v.x) & 0x1FFFFF;
+    const int64_t iy = std::llround(v.y) & 0x1FFFFF;
+    const int64_t iz = std::llround(v.z) & 0x1FFFFF;
+    return (ix << 42) | (iz << 21) | iy;
+}
+
+void build_bodies(const std::vector<WTri>& local, const Instance& inst, std::vector<BodyMesh>& out) {
+    out.clear();
+    std::vector<WTri> world(local.size());
+    for (size_t i = 0; i < local.size(); ++i) {
+        for (int k = 0; k < 3; ++k) {
+            const V3& p = local[i].p[k];
+            const float x = p.x * inst.scale[0];
+            const float y = p.y * inst.scale[1];
+            const float z = p.z * inst.scale[2];
+            world[i].p[k] = {inst.mtx[0] * x + inst.mtx[1] * y + inst.mtx[2] * z + inst.mtx[3],
+                inst.mtx[4] * x + inst.mtx[5] * y + inst.mtx[6] * z + inst.mtx[7],
+                inst.mtx[8] * x + inst.mtx[9] * y + inst.mtx[10] * z + inst.mtx[11]};
+        }
+    }
+    // Union triangles that share a vertex.
+    std::vector<int> parent(world.size());
+    for (size_t i = 0; i < parent.size(); ++i) {
+        parent[i] = static_cast<int>(i);
+    }
+    auto find = [&](int a) {
+        while (parent[a] != a) {
+            parent[a] = parent[parent[a]];
+            a = parent[a];
+        }
+        return a;
+    };
+    std::unordered_map<int64_t, int> owner;
+    for (size_t i = 0; i < world.size(); ++i) {
+        for (int k = 0; k < 3; ++k) {
+            auto ins = owner.emplace(vert_key(world[i].p[k]), static_cast<int>(i));
+            if (!ins.second) {
+                const int a = find(ins.first->second);
+                const int b = find(static_cast<int>(i));
+                if (a != b) {
+                    parent[b] = a;
+                }
+            }
+        }
+    }
+    std::unordered_map<int, size_t> bodyOf;
+    for (size_t i = 0; i < world.size(); ++i) {
+        const int root = find(static_cast<int>(i));
+        auto it = bodyOf.find(root);
+        if (it == bodyOf.end()) {
+            it = bodyOf.emplace(root, out.size()).first;
+            out.emplace_back();
+        }
+        BodyMesh& b = out[it->second];
+        b.tris.push_back(world[i]);
+        const WTri& t = world[i];
+        b.area += 0.5f * std::fabs((t.p[1].x - t.p[0].x) * (t.p[2].z - t.p[0].z) -
+                                   (t.p[1].z - t.p[0].z) * (t.p[2].x - t.p[0].x));
+        for (int k = 0; k < 3; ++k) {
+            b.ymin = std::min(b.ymin, t.p[k].y);
+            b.ymax = std::max(b.ymax, t.p[k].y);
+            b.x0 = std::min(b.x0, t.p[k].x);
+            b.x1 = std::max(b.x1, t.p[k].x);
+            b.z0 = std::min(b.z0, t.p[k].z);
+            b.z1 = std::max(b.z1, t.p[k].z);
+        }
+    }
+}
+
+void build_shoreline(BodyMesh& b) {
+    struct EdgeUse {
+        V3 a, c;
+        int count;
+    };
+    std::unordered_map<uint64_t, EdgeUse> edges;
+    for (const WTri& t : b.tris) {
+        for (int k = 0; k < 3; ++k) {
+            const V3& a = t.p[k];
+            const V3& c = t.p[(k + 1) % 3];
+            const int64_t ka = vert_key(a);
+            const int64_t kc = vert_key(c);
+            const uint64_t lo = static_cast<uint64_t>(std::min(ka, kc));
+            const uint64_t hi = static_cast<uint64_t>(std::max(ka, kc));
+            const uint64_t key = lo * 1000003ull ^ (hi * 0x9E3779B97F4A7C15ull);
+            auto it = edges.find(key);
+            if (it == edges.end()) {
+                edges.emplace(key, EdgeUse{a, c, 1});
+            } else {
+                ++it->second.count;
+            }
+        }
+    }
+    b.segs.clear();
+    b.segGrid.clear();
+    for (const auto& kv : edges) {
+        if (kv.second.count != 1) {
+            continue;
+        }
+        b.segs.push_back({kv.second.a.x, kv.second.a.z, kv.second.c.x, kv.second.c.z});
+    }
+    const float reach = kWaveEdgeFar + 1.0f;
+    for (size_t i = 0; i < b.segs.size(); ++i) {
+        const Seg& s = b.segs[i];
+        const int ix0 = static_cast<int>(std::floor((std::min(s.ax, s.bx) - reach) / kSegCell));
+        const int ix1 = static_cast<int>(std::floor((std::max(s.ax, s.bx) + reach) / kSegCell));
+        const int iz0 = static_cast<int>(std::floor((std::min(s.az, s.bz) - reach) / kSegCell));
+        const int iz1 = static_cast<int>(std::floor((std::max(s.az, s.bz) + reach) / kSegCell));
+        for (int ix = ix0; ix <= ix1; ++ix) {
+            for (int iz = iz0; iz <= iz1; ++iz) {
+                b.segGrid[cell_key(ix, iz)].push_back(static_cast<int>(i));
+            }
+        }
+    }
+}
+
+// Conforming subdivision: an edge is split exactly when it is longer than `limit`, a decision that
+// depends only on the edge's endpoints, so neighbouring triangles always agree and no cracks form.
+struct Subdivider {
+    float limit;
+    std::vector<WTri>* out;
+    size_t cap;
+    bool overflow = false;
+
+    static V3 mid(const V3& a, const V3& b) {
+        return {(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f};
+    }
+    static float len(const V3& a, const V3& b) {
+        const float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    void run(V3 a, V3 b, V3 c, int depth) {
+        if (overflow) {
+            return;
+        }
+        int mask = 0;
+        if (depth < 14) {
+            mask = (len(a, b) > limit ? 1 : 0) | (len(b, c) > limit ? 2 : 0) |
+                   (len(c, a) > limit ? 4 : 0);
+        }
+        if (mask == 0) {
+            if (out->size() >= cap) {
+                overflow = true;
+                return;
+            }
+            out->push_back({{a, b, c}});
+            return;
+        }
+        // Rotate so the split edges take a canonical position (AB for one, AB+BC for two).
+        auto rotate = [&]() {
+            const V3 t = a;
+            a = b;
+            b = c;
+            c = t;
+            mask = ((mask << 2) | (mask >> 1)) & 7; // edge AB->BC->CA->AB
+        };
+        const int pop = (mask & 1) + ((mask >> 1) & 1) + ((mask >> 2) & 1);
+        if (pop == 1) {
+            while (mask != 1) {
+                rotate();
+            }
+            const V3 m = mid(a, b);
+            run(a, m, c, depth + 1);
+            run(m, b, c, depth + 1);
+        } else if (pop == 2) {
+            while (mask != 3) {
+                rotate();
+            }
+            const V3 m1 = mid(a, b);
+            const V3 m2 = mid(b, c);
+            run(m1, b, m2, depth + 1);
+            run(a, m1, m2, depth + 1);
+            run(a, m2, c, depth + 1);
+        } else {
+            const V3 m0 = mid(a, b);
+            const V3 m1 = mid(b, c);
+            const V3 m2 = mid(c, a);
+            run(a, m0, m2, depth + 1);
+            run(m0, b, m1, depth + 1);
+            run(m2, m1, c, depth + 1);
+            run(m0, m1, m2, depth + 1);
+        }
+    }
+};
+
+void build_mesh(BodyMesh& b) {
+    build_shoreline(b);
+    std::vector<WTri> tris;
+    if (b.style == STYLE_OPEN) {
+        float limit = std::max(160.0f, std::sqrt(b.area / (0.43f * 30000.0f)));
+        for (int attempt = 0; attempt < 6; ++attempt) {
+            tris.clear();
+            Subdivider sub{limit, &tris, kMaxBodyTris};
+            for (const WTri& t : b.tris) {
+                sub.run(t.p[0], t.p[1], t.p[2], 0);
+            }
+            if (!sub.overflow) {
+                break;
+            }
+            limit *= 1.7f;
+        }
+    } else {
+        tris = b.tris;
+    }
+    b.verts.clear();
+    b.verts.reserve(tris.size() * 12);
+    for (const WTri& t : tris) {
+        for (int k = 0; k < 3; ++k) {
+            const V3& v = t.p[k];
+            const float amp = wave_amp_at(b, v.x, v.z);
+            b.verts.push_back(v.x);
+            b.verts.push_back(v.y);
+            b.verts.push_back(v.z);
+            b.verts.push_back(static_cast<float>(b.style) * 8.0f + amp);
+        }
+    }
+    b.built = true;
+}
+
+// Depth of the ground below the water at a point; `found` is false when there is no collision.
+float probe_depth_ex(float x, float waterY, float z, bool& found) {
+    static dBgS_GndChk gnd;
+    cXyz pos(x, waterY - 2.0f, z);
+    gnd.SetPos(&pos);
+    const float groundY = dComIfG_Bgsp().GroundCross(&gnd);
+    found = groundY != -G_CM3D_F_INF;
+    return found ? std::max(waterY - groundY, 0.0f) : 2000.0f;
+}
+
+bool decide_style(BodyMesh& b) {
+    if (in_morpheel_arena()) {
+        b.style = STYLE_FLAT;
+        return true;
+    }
+    if (b.ymax - b.ymin > 60.0f) {
+        b.style = STYLE_FLOWING;
+        return true;
+    }
+    if (b.area < kOpenMinArea) {
+        b.style = STYLE_STILL;
+        return true;
+    }
+    std::vector<float> depths;
+    const size_t step = std::max<size_t>(1, b.tris.size() / 16);
+    for (size_t i = 0; i < b.tris.size(); i += step) {
+        const WTri& t = b.tris[i];
+        const float cx = (t.p[0].x + t.p[1].x + t.p[2].x) / 3.0f;
+        const float cy = (t.p[0].y + t.p[1].y + t.p[2].y) / 3.0f;
+        const float cz = (t.p[0].z + t.p[1].z + t.p[2].z) / 3.0f;
+        bool found = false;
+        const float d = probe_depth_ex(cx, cy, cz, found);
+        if (found) {
+            depths.push_back(d);
+        }
+    }
+    if (depths.empty()) {
+        if (++b.deferred < 120) {
+            return false; // collision not loaded yet; try again next frame
+        }
+        b.style = STYLE_OPEN;
+        return true;
+    }
+    std::sort(depths.begin(), depths.end());
+    b.style = depths[depths.size() / 2] >= kOpenMinDepth ? STYLE_OPEN : STYLE_STILL;
+    return true;
+}
+
+struct WorldWater {
+    float mtx[12];
+    float scale[3];
+    unsigned gen = 0;
+    uint64_t lastFrame = 0;
+    std::vector<BodyMesh> bodies;
+};
+std::unordered_map<const void*, std::vector<WorldWater>> g_worldWater;
+std::vector<BodyMesh*> g_activeBodies; // bodies drawn this frame (game thread only)
+uint64_t g_frameNo = 0;
+
+WorldWater* get_world_water(const Instance& inst, const LocalWater& lw) {
+    std::vector<WorldWater>& list = g_worldWater[inst.md];
+    for (WorldWater& w : list) {
+        if (w.gen == lw.gen && std::memcmp(w.mtx, inst.mtx, sizeof(w.mtx)) == 0 &&
+            std::memcmp(w.scale, inst.scale, sizeof(w.scale)) == 0)
+        {
+            return &w;
+        }
+    }
+    if (list.size() >= 6) {
+        list.erase(list.begin());
+    }
+    list.emplace_back();
+    WorldWater& w = list.back();
+    std::memcpy(w.mtx, inst.mtx, sizeof(w.mtx));
+    std::memcpy(w.scale, inst.scale, sizeof(w.scale));
+    w.gen = lw.gen;
+    build_bodies(lw.tris, inst, w.bodies);
+    return &w;
+}
+
+// CPU lookup used by the swim-height hook: wave amplitude (0..1) at a point if it lies on one of
+// the drawn open-water bodies at about the given height.
+bool water_amp_at(float x, float y, float z, float& amp) {
+    for (BodyMesh* b : g_activeBodies) {
+        if (b->style != STYLE_OPEN || x < b->x0 || x > b->x1 || z < b->z0 || z > b->z1) {
+            continue;
+        }
+        for (const WTri& t : b->tris) {
+            const float d = (t.p[1].z - t.p[2].z) * (t.p[0].x - t.p[2].x) +
+                            (t.p[2].x - t.p[1].x) * (t.p[0].z - t.p[2].z);
+            if (std::fabs(d) < 1e-6f) {
+                continue;
+            }
+            const float l1 = ((t.p[1].z - t.p[2].z) * (x - t.p[2].x) +
+                                 (t.p[2].x - t.p[1].x) * (z - t.p[2].z)) / d;
+            const float l2 = ((t.p[2].z - t.p[0].z) * (x - t.p[2].x) +
+                                 (t.p[0].x - t.p[2].x) * (z - t.p[2].z)) / d;
+            const float l3 = 1.0f - l1 - l2;
+            if (l1 < -0.001f || l2 < -0.001f || l3 < -0.001f) {
+                continue;
+            }
+            const float h = l1 * t.p[0].y + l2 * t.p[1].y + l3 * t.p[2].y;
+            if (std::fabs(h - y) > 40.0f) {
+                continue;
+            }
+            amp = wave_amp_at(*b, x, z);
+            return true;
+        }
+    }
+    return false;
 }
 
 DEFINE_HOOK(&dBgS::SplGrpChk, SplGrpCheck);
 
 void on_spl_grp_chk_post(ModContext*, void* args, void* retval, void*) {
-    if (g_inOwnProbe || !g_snapshotReady || retval == nullptr || !*static_cast<bool*>(retval)) {
+    if (g_inOwnProbe || g_activeBodies.empty() || retval == nullptr || !*static_cast<bool*>(retval)) {
         return;
     }
-    if (!get_bool_option(g_cvarEnabled, true) || !get_bool_option(g_cvarSwim, true) ||
-        get_int_option(g_cvarMode, 1) != 1)
-    {
+    if (!get_bool_option(g_cvarEnabled, true) || !get_bool_option(g_cvarSwim, true)) {
         return;
     }
     dBgS_SplGrpChk* chk = mods::arg<dBgS_SplGrpChk*>(args, 1);
@@ -577,19 +1097,14 @@ void on_spl_grp_chk_post(ModContext*, void* args, void* retval, void*) {
     }
     const float x = chk->GetPosP().x;
     const float z = chk->GetPosP().z;
-    float openness = 0.0f;
-    float depth = 0.0f;
-    if (!cpu_surface_info(x, z, openness, depth)) {
+    float amp = 0.0f;
+    if (!water_amp_at(x, chk->GetHeight(), z, amp) || amp <= 0.0f) {
         return;
     }
     const float heightScale =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarWaveHeight, 100), 0, 300)) /
         100.0f;
-    const float scale = heightScale * openness * smoothstep_f(40.0f, 320.0f, depth);
-    if (scale <= 0.0f) {
-        return;
-    }
-    chk->SetHeight(chk->GetHeight() + cpu_wave_height(x, z, elapsed_seconds()) * scale);
+    chk->SetHeight(chk->GetHeight() + cpu_wave_height(x, z, elapsed_seconds()) * heightScale * amp);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -678,7 +1193,7 @@ bool build_pipeline(const GfxRenderTargetLayout& layout) {
 
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
-    fragment.entryPoint = {"fs_main", WGPU_STRLEN};
+    fragment.entryPoint = {"fs_mesh", WGPU_STRLEN};
     fragment.targetCount = colorTargetCount;
     fragment.targets = colorTargets;
 
@@ -691,7 +1206,7 @@ bool build_pipeline(const GfxRenderTargetLayout& layout) {
     WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
     desc.label = {"Better Water", WGPU_STRLEN};
     desc.vertex.module = module;
-    desc.vertex.entryPoint = {"vs_main", WGPU_STRLEN};
+    desc.vertex.entryPoint = {"vs_mesh", WGPU_STRLEN};
     desc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
     desc.primitive.cullMode = WGPUCullMode_None;
     desc.depthStencil = &depthStencil;
@@ -1139,10 +1654,17 @@ void fill_uniforms(Uniforms& uni, const CameraInfo& camera, uint32_t width, uint
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarColor, 0), 0, 2)), overlay);
 }
 
-// Game thread, after opaque scene draws and before translucent overlays (including stock water).
-// Keeps the water lattices up to date; in "Custom surface" mode it also draws the surface.
+// Game thread, after opaque scene draws and before translucent overlays. Builds the water meshes
+// for the models captured this frame and draws them.
+std::vector<float> g_meshScratch;
+bool g_loggedBudget = false;
+
 void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) {
+    ++g_frameNo;
     g_frameValid = false;
+    g_activeBodies.clear();
+    std::vector<Instance> instances;
+    instances.swap(g_instances);
     if (!get_bool_option(g_cvarEnabled, true)) {
         return;
     }
@@ -1168,12 +1690,10 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         g_framePlayer[2] = player->current.pos.z;
     }
     {
+        // Swim ripples: on while Link is in or at the surface of the water, stronger when moving.
         float refH = 0.0f;
         const bool inWaterZone = probe_water(g_framePlayer[0], playerY, g_framePlayer[2], refH) &&
                                  refH <= playerY + 250.0f;
-        g_refY = inWaterZone ? refH : playerY;
-
-        // Swim ripples: on while Link is in or at the surface of the water, stronger when moving.
         static float lastX = 0.0f;
         static float lastZ = 0.0f;
         static float lastT = -1.0f;
@@ -1190,24 +1710,48 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         const float target = swimming ? std::clamp(0.3f + speed / 250.0f, 0.3f, 1.0f) : 0.0f;
         g_rippleIntensity += (target - g_rippleIntensity) * std::clamp(dt * 4.0f, 0.0f, 1.0f);
     }
-    const bool fineOpen = update_lattice(g_fine, g_snapshot.data(), camera, playerY);
-    const bool coarseOpen = update_lattice(
-        g_coarse, g_snapshot.data() + kLatticeWidth * kLatticeWidth, camera, playerY);
-    update_spray(camera);
-    // Nothing open nearby: skip the draw entirely.
-    if (!fineOpen && !coarseOpen) {
+
+    g_meshScratch.clear();
+    for (const Instance& inst : instances) {
+        auto lwIt = g_localWater.find(inst.md);
+        if (lwIt == g_localWater.end() || lwIt->second.tris.empty()) {
+            continue;
+        }
+        WorldWater* ww = get_world_water(inst, lwIt->second);
+        ww->lastFrame = g_frameNo;
+        for (BodyMesh& body : ww->bodies) {
+            if (body.style < 0 && !decide_style(body)) {
+                continue;
+            }
+            if (!body.built) {
+                build_mesh(body);
+            }
+            if (g_meshScratch.size() / 4 + body.verts.size() / 4 > kMaxFrameVerts) {
+                if (!g_loggedBudget) {
+                    g_loggedBudget = true;
+                    svc_log->warn(mod_ctx, "water mesh budget reached; some water not drawn");
+                }
+                continue;
+            }
+            g_meshScratch.insert(g_meshScratch.end(), body.verts.begin(), body.verts.end());
+            g_activeBodies.push_back(&body);
+        }
+    }
+    // Drop meshes of models that have not been drawn for a while.
+    if ((g_frameNo & 255u) == 0) {
+        for (auto it = g_worldWater.begin(); it != g_worldWater.end();) {
+            auto& list = it->second;
+            list.erase(std::remove_if(list.begin(), list.end(),
+                           [](const WorldWater& w) { return g_frameNo - w.lastFrame > 900; }),
+                list.end());
+            it = list.empty() ? g_worldWater.erase(it) : std::next(it);
+        }
+    }
+    if (g_meshScratch.empty()) {
         return;
     }
 
     g_frameCamera = camera;
-    g_frameValid = true;
-    g_collisionEye[0] = camera.eye[0];
-    g_collisionEye[1] = camera.eye[2];
-    g_snapshotReady = true;
-
-    if (get_int_option(g_cvarMode, 1) != 1) {
-        return; // Sunshine mode draws from the before-HUD hook, after the stock water.
-    }
 
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
     resolveDesc.color = true;
@@ -1229,8 +1773,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     GfxRange uniformRange{0, 0};
     GfxRange storageRange{0, 0};
     if (svc_gfx->push_uniform(mod_ctx, &uni, sizeof(uni), &uniformRange) != MOD_OK ||
-        svc_gfx->push_storage(mod_ctx, g_snapshot.data(), sizeof(g_snapshot), &storageRange) !=
-            MOD_OK)
+        svc_gfx->push_storage(mod_ctx, g_meshScratch.data(), g_meshScratch.size() * sizeof(float),
+            &storageRange) != MOD_OK)
     {
         return;
     }
@@ -1242,22 +1786,12 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     payload.uniform_size = uniformRange.size;
     payload.storage_offset = storageRange.offset;
     payload.storage_size = storageRange.size;
-    payload.vertex_count = static_cast<uint32_t>(kGridQuads) * kGridQuads * 6u;
+    payload.vertex_count = static_cast<uint32_t>(g_meshScratch.size() / 4);
     if (svc_gfx->push_draw(mod_ctx, g_drawType, &payload, sizeof(payload)) == MOD_OK &&
         !g_loggedFirstDraw)
     {
         g_loggedFirstDraw = true;
-        svc_log->info(mod_ctx, "first water surface queued");
-    }
-    // Waterfall spray droplets, drawn over the water.
-    if (g_sprayCount > 0 && g_sunDrawType != 0 && get_bool_option(g_cvarSpray, true)) {
-        SunPayload spray{};
-        spray.depth = resolved.depth;
-        spray.uniform_offset = uniformRange.offset;
-        spray.uniform_size = uniformRange.size;
-        spray.vertex_count = 8u * kSprayPerEmitter * 6u;
-        spray.mode = 2;
-        svc_gfx->push_draw(mod_ctx, g_sunDrawType, &spray, sizeof(spray));
+        svc_log->info(mod_ctx, "first water mesh queued");
     }
 }
 
