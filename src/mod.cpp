@@ -46,6 +46,7 @@
 #include "JSystem/J3DGraphBase/J3DShapeDraw.h"
 #include "JSystem/JUtility/JUTNameTab.h"
 #include <set>
+#include <aurora/dl.hpp>
 
 DEFINE_MOD();
 IMPORT_SERVICE(LogService, svc_log);
@@ -504,6 +505,54 @@ void on_bg_maxx_post(ModContext*, void* args, void*, void*) {
                 }
             }
             flags = 0;
+        }
+        if (sh != nullptr) {
+            J3DVertexData* vd = &md->getVertexData();
+            const u8* pos = (const u8*)vd->getVtxPosArray();
+            const int ptype = vd->getVtxPosType();
+            const u8 pfrac = vd->getVtxPosFrac();
+            unsigned tris = 0, bad = 0;
+            float mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
+            float minArea = 1e30f, maxArea = 0.0f;
+            for (u16 g = 0; g < groups && pos != nullptr; ++g) {
+                J3DShapeDraw* d = sh->getShapeDraw(g);
+                if (d == nullptr || d->getDisplayList() == nullptr) {
+                    continue;
+                }
+                aurora::gx::dl::Reader rd((const u8*)d->getDisplayList(), d->getDisplayListSize(), sh->getVtxDesc());
+                while (auto c = rd.next()) {
+                    if (c->kind != aurora::gx::dl::Command::Kind::Draw) {
+                        continue;
+                    }
+                    auto P = [&](u32 v, float* o) {
+                        const u32 ix = c->draw.attr_idx(v, GX_VA_POS);
+                        if (ptype == GX_F32) {
+                            const float* f = (const float*)(pos + ix * 12);
+                            o[0] = f[0]; o[1] = f[1]; o[2] = f[2];
+                        } else {
+                            const s16* f = (const s16*)(pos + ix * 6);
+                            const float sc = 1.0f / (float)(1 << pfrac);
+                            o[0] = f[0] * sc; o[1] = f[1] * sc; o[2] = f[2] * sc;
+                        }
+                        for (int k = 0; k < 3; ++k) { mn[k] = std::min(mn[k], o[k]); mx[k] = std::max(mx[k], o[k]); }
+                    };
+                    const bool ok = aurora::gx::dl::expand_triangles(c->draw.prim, c->draw.vtxCount,
+                        [&](u16 a, u16 b, u16 cc) {
+                            float A[3], B[3], C[3];
+                            P(a, A); P(b, B); P(cc, C);
+                            const float ux = B[0]-A[0], uz = B[2]-A[2], vx = C[0]-A[0], vz = C[2]-A[2];
+                            const float ar = fabsf(ux * vz - uz * vx) * 0.5f;
+                            minArea = std::min(minArea, ar); maxArea = std::max(maxArea, ar);
+                            ++tris;
+                        });
+                    if (!ok) ++bad;
+                }
+                if (rd.failed()) ++bad;
+            }
+            snprintf(line, sizeof(line),
+                "[waterscan]     tris=%u bad=%u posType=%d frac=%u Y[%.1f..%.1f] X[%.0f..%.0f] Z[%.0f..%.0f] area[%.0f..%.0f]",
+                tris, bad, ptype, (unsigned)pfrac, mn[1], mx[1], mn[0], mx[0], mn[2], mx[2], minArea, maxArea);
+            svc_log->info(mod_ctx, line);
         }
         snprintf(line, sizeof(line), "[waterscan]   mat %u '%s' shape=%p groups=%u dl=%uB flag=%u", (unsigned)i, nm,
             (void*)sh, groups, dlBytes, flags);
