@@ -40,6 +40,12 @@
 #include "d/d_bg_s_wtr_chk.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_kankyo.h"
+#include "JSystem/J3DGraphAnimator/J3DModelData.h"
+#include "JSystem/J3DGraphBase/J3DMaterial.h"
+#include "JSystem/J3DGraphBase/J3DShape.h"
+#include "JSystem/J3DGraphBase/J3DShapeDraw.h"
+#include "JSystem/JUtility/JUTNameTab.h"
+#include <set>
 
 DEFINE_MOD();
 IMPORT_SERVICE(LogService, svc_log);
@@ -450,6 +456,59 @@ bool cpu_surface_info(float x, float z, float& openness, float& depth) {
     openness = open;
     depth = d / sum;
     return open >= 0.01f;
+}
+
+
+// ---- Stage water material scan (diagnostic only; logs, never changes drawing) ----
+DEFINE_HOOK(&dKy_bg_MAxx_proc, BgMaxxProc);
+
+void on_bg_maxx_post(ModContext*, void* args, void*, void*) {
+    static std::set<const void*> seen;
+    J3DModel* model = mods::arg<J3DModel*>(args, 0);
+    if (model == nullptr) {
+        return;
+    }
+    J3DModelData* md = model->getModelData();
+    if (md == nullptr || !seen.insert(md).second) {
+        return;
+    }
+    JUTNameTab* names = md->getMaterialName();
+    const u16 n = md->getMaterialNum();
+    char line[320];
+    snprintf(line, sizeof(line), "[waterscan] model %p: %u materials, %u shapes", (void*)md,
+        (unsigned)n, (unsigned)md->getShapeNum());
+    svc_log->info(mod_ctx, line);
+    for (u16 i = 0; i < n && names != nullptr; ++i) {
+        const char* nm = names->getName(i);
+        if (nm == nullptr || strlen(nm) < 8) {
+            continue;
+        }
+        const bool ma = nm[3] == 'M' && nm[4] == 'A';
+        const bool wordy = strstr(nm, "ater") || strstr(nm, "aki") || strstr(nm, "unsui") ||
+                           strstr(nm, "izu") || strstr(nm, "uisou");
+        if (!ma && !wordy) {
+            continue;
+        }
+        if (ma && !(nm[5] == '0' && (nm[6] == '1' || nm[6] == '2' || nm[6] == '3' || nm[6] == '6' || nm[6] == '9')) && !wordy) {
+            continue;
+        }
+        J3DMaterial* mat = md->getMaterialNodePointer(i);
+        J3DShape* sh = mat != nullptr ? mat->getShape() : nullptr;
+        unsigned groups = 0, dlBytes = 0, flags = 0;
+        if (sh != nullptr) {
+            groups = sh->getMtxGroupNum();
+            for (u16 g = 0; g < groups; ++g) {
+                J3DShapeDraw* d = sh->getShapeDraw(g);
+                if (d != nullptr) {
+                    dlBytes += d->getDisplayListSize();
+                }
+            }
+            flags = 0;
+        }
+        snprintf(line, sizeof(line), "[waterscan]   mat %u '%s' shape=%p groups=%u dl=%uB flag=%u", (unsigned)i, nm,
+            (void*)sh, groups, dlBytes, flags);
+        svc_log->info(mod_ctx, line);
+    }
 }
 
 DEFINE_HOOK(&dBgS::SplGrpChk, SplGrpCheck);
@@ -1400,6 +1459,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     sunDrawDesc.draw = on_sun_draw;
     if (svc_gfx->register_draw_type(mod_ctx, &sunDrawDesc, &g_sunDrawType) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register Sunshine draw type");
+    }
+    if (mods::hook::add_post<BgMaxxProc>(on_bg_maxx_post) != MOD_OK) {
+        svc_log->warn(mod_ctx, "could not hook stage material scan");
     }
     // Wave collision: add the wave height to the game's water height queries on open water.
     if (mods::hook::add_post<SplGrpCheck>(on_spl_grp_chk_post) != MOD_OK) {
