@@ -541,6 +541,34 @@ int water_role(const char* nm) {
 // Minimal GX display-list reader (draw commands only). The water shapes carry nothing else.
 // Vertex attributes are one byte (direct matrix indices, INDEX8) or two (INDEX16), big-endian.
 unsigned g_dlUnsupported = 0;
+unsigned g_dlDiagCount = 0;
+
+// Logs what the display-list reader could not parse (first few times only), so the format can be
+// fixed from real data.
+void log_dl_diag(const char* why, J3DShape* sh, const u8* dl, u32 size, u32 at, unsigned stride) {
+    if (g_dlDiagCount >= 8) {
+        return;
+    }
+    ++g_dlDiagCount;
+    char buf[512];
+    int n = std::snprintf(buf, sizeof(buf), "water dl diag: %s; size=%u at=%u stride=%u head=", why,
+        static_cast<unsigned>(size), static_cast<unsigned>(at), stride);
+    for (u32 i = 0; i < 24 && i < size && n < 400; ++i) {
+        n += std::snprintf(buf + n, sizeof(buf) - n, "%02x", dl != nullptr ? dl[i] : 0);
+    }
+    n += std::snprintf(buf + n, sizeof(buf) - n, " fail=");
+    for (u32 i = at; i < at + 16 && i < size && n < 480; ++i) {
+        n += std::snprintf(buf + n, sizeof(buf) - n, "%02x", dl[i]);
+    }
+    if (sh != nullptr && sh->getVtxDesc() != nullptr && n < 440) {
+        n += std::snprintf(buf + n, sizeof(buf) - n, " desc=");
+        for (const GXVtxDescList* d = sh->getVtxDesc(); d->attr != GX_VA_NULL && n < 500; ++d) {
+            n += std::snprintf(buf + n, sizeof(buf) - n, "%d:%d,", static_cast<int>(d->attr),
+                static_cast<int>(d->type));
+        }
+    }
+    svc_log->info(mod_ctx, buf);
+}
 
 void extract_shape_tris(J3DModelData* md, J3DShape* sh, std::vector<WTri>& out) {
     J3DVertexData* vd = &md->getVertexData();
@@ -558,6 +586,8 @@ void extract_shape_tris(J3DModelData* md, J3DShape* sh, std::vector<WTri>& out) 
     for (const GXVtxDescList* d = sh->getVtxDesc(); d->attr != GX_VA_NULL; ++d) {
         static const unsigned kSize[] = {0, 1, 1, 2};
         if (d->type > GX_INDEX16) {
+            ++g_dlUnsupported;
+            log_dl_diag("vertex attribute type unsupported", sh, nullptr, 0, 0, stride);
             return;
         }
         if (d->attr == GX_VA_POS) {
@@ -565,6 +595,8 @@ void extract_shape_tris(J3DModelData* md, J3DShape* sh, std::vector<WTri>& out) 
             posOff = stride;
             posIndex16 = d->type == GX_INDEX16;
             if (d->type == GX_DIRECT) {
+                ++g_dlUnsupported;
+                log_dl_diag("direct positions", sh, nullptr, 0, 0, stride);
                 return; // direct positions are not used by stage water
             }
         }
@@ -606,6 +638,7 @@ void extract_shape_tris(J3DModelData* md, J3DShape* sh, std::vector<WTri>& out) 
             const u8 prim = op & 0xF8;
             if (prim != 0x80 && prim != 0x90 && prim != 0x98 && prim != 0xA0) {
                 ++g_dlUnsupported;
+                log_dl_diag("unsupported opcode", sh, dl, size, r, stride);
                 break; // anything else (state loads, other primitives): stop reading this list
             }
             if (r + 3 > size) {
@@ -701,6 +734,11 @@ void scan_model(J3DModelData* md, LocalWater& lw) {
         if (have.find(centroid_key(t)) == have.end()) {
             lw.tris.push_back(t);
         }
+    }
+    if (lw.tris.empty() && !lw.hide.empty()) {
+        // Nothing to draw in place of the stock water: leave it visible rather than leaving
+        // invisible water.
+        lw.hide.clear();
     }
     char line[200];
     std::snprintf(line, sizeof(line), "water model %p: %zu layers hidden, %zu triangles%s", (void*)md,
